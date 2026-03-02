@@ -1,0 +1,10 @@
+dataset:
+  # Path to your ILSVRC (ImageNet) root directory containing /train and /val
+  root_dir: "/data/imagenet"
+  image_size: 256
+
+dataloader:
+  batch_size: 32
+  num_workers: 8      # Set according to your CPU cores (e.g., typically 4-8 on regular lab machines)
+  pin_memory: true    # Crucial for fast CPU-to-GPU memory transfer
+  prefetch_factor: 2  # Caches batches asynchronously 

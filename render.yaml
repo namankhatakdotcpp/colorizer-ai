@@ -1,0 +1,64 @@
+services:
+  # ---------------------------------------------------------
+  # BACKEND SERVICE (FastAPI + PyTorch)
+  # ---------------------------------------------------------
+  - type: web
+    name: colorizer-backend
+    env: docker
+    region: oregon 
+    
+    # We specify the subfolder so Render only builds what it needs
+    rootDir: ./backend
+    
+    # Deployment Command
+    # We use Gunicorn with Uvicorn workers to scale out across CPU cores natively.
+    # Uvicorn alone is recommended for single-core. Gunicorn orchestrates Uvicorn workers multi-core.
+    # --preload ensures the model is loaded ONCE by Gunicorn before forking workers (Memory Saving!).
+    dockerCommand: "gunicorn app.main:app --workers 2 --worker-class uvicorn.workers.UvicornWorker --bind 0.0.0.0:$PORT --timeout 120 --preload"
+    
+    numInstances: 1
+    
+    # Use an instance type with higher RAM / CPU if you intend to run PyTorch inference rapidly.
+    # Example: standard (2GB RAM) or pro (4GB+ RAM)
+    plan: standard
+    
+    healthCheckPath: /health
+    
+    # Persistent Disk (Crucial for Machine Learning Checkpoints)
+    # This prevents the 500MB+ PyTorch weights from having to be downloaded
+    # or baked into the Docker image upon every single CI/CD deployment push.
+    disk:
+      name: model-weights
+      mountPath: /app/checkpoints
+      sizeGB: 10
+      
+    envVars:
+      - key: PORT
+        value: "8000"
+      - key: ENVIRONMENT
+        value: production
+      - key: BACKEND_CORS_ORIGINS
+        # In production this restricts access entirely to your Vercel frontend URL
+        value: "https://your-nextjs-frontend-app.vercel.app" 
+      - key: USE_HALF_PRECISION
+        value: "false" # Set to True ONLY if Render provides a GPU instance layer (rare on standard plans)
+      - key: MAX_FILE_SIZE_MB
+        value: "10"
+      - key: MAX_IMAGE_DIMENSION
+        value: "1024"
+        
+  # ---------------------------------------------------------
+  # FRONTEND CAPABILITY (Note: Best hosted on Vercel natively)
+  # Keeping this here purely for Render Monorepo completion if needed.
+  # ---------------------------------------------------------
+  # - type: web
+  #   name: colorizer-frontend
+  #   env: docker
+  #   rootDir: ./frontend
+  #   plan: free
+  #   envVars:
+  #     - key: NEXT_PUBLIC_API_URL
+  #       fromService:
+  #         type: web
+  #         name: colorizer-backend
+  #         envVarKey: RENDER_EXTERNAL_URL

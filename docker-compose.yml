@@ -1,0 +1,66 @@
+version: '3.8'
+
+# Production-ready compose configuration for full-stack orchestration
+services:
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile.dev
+
+    ports:
+      - "8000:8000"
+    environment:
+      # General configuration
+      - ENVIRONMENT=production
+      - PORT=8000
+      - WORKERS=2 # Adjust based on CPU cores for gunicorn/uvicorn handling
+
+      # Application thresholds
+      - MAX_FILE_SIZE_MB=15
+      - MAX_IMAGE_DIMENSION=1024
+
+      # PyTorch / CUDA flags
+      - USE_HALF_PRECISION=true
+
+      # Security (restrict CORS origin to the internal docker network or domain)
+      - BACKEND_CORS_ORIGINS=http://localhost:3000,http://frontend:3000
+
+    # Checkpoints mapped via volume to avoid bloating the immutable container
+    volumes:
+      - ./backend/checkpoints:/app/checkpoints:ro
+    restart: unless-stopped
+    healthcheck:
+      test: [ "CMD", "curl", "-f", "http://localhost:8000/health" ]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    ports:
+      - "3000:3000"
+    environment:
+      # Connect standard Next.js build output natively to orchestrated backend via docker routing
+      - NEXT_PUBLIC_API_URL=http://localhost:8000 # Use public URL as client browsers execute this, not the container!
+    depends_on:
+      backend:
+        condition: service_healthy # Next.js frontend waits for FastAPI lifespan PyTorch model load correctly
+    restart: unless-stopped
+
+  # Prometheus Observability Service
+  prometheus:
+    image: prom/prometheus:latest
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus_data:/prometheus
+    ports:
+      - "9090:9090"
+    restart: unless-stopped
+    depends_on:
+      - backend
+
+volumes:
+  prometheus_data:

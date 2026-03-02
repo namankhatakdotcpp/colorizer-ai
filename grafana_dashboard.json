@@ -1,0 +1,132 @@
+{
+    "__inputs": [
+        {
+            "name": "DS_PROMETHEUS",
+            "label": "Prometheus",
+            "description": "",
+            "type": "datasource",
+            "pluginId": "prometheus",
+            "pluginName": "Prometheus"
+        }
+    ],
+    "__elements": {},
+    "__requires": [
+        {
+            "type": "grafana",
+            "id": "grafana",
+            "name": "Grafana",
+            "version": "10.0.0"
+        }
+    ],
+    "annotations": {
+        "list": []
+    },
+    "editable": true,
+    "fiscalYearStartMonth": 0,
+    "graphTooltip": 0,
+    "id": null,
+    "links": [],
+    "liveNow": false,
+    "panels": [
+        {
+            "title": "Total Colorizer Inferences",
+            "type": "stat",
+            "datasource": {
+                "type": "prometheus",
+                "uid": "${DS_PROMETHEUS}"
+            },
+            "gridPos": {
+                "h": 8,
+                "w": 8,
+                "x": 0,
+                "y": 0
+            },
+            "targets": [
+                {
+                    "expr": "sum(rate(fastapi_requests_total{endpoint=\"/colorize\", status=\"200\"}[5m]))",
+                    "legendFormat": "Successful Requests / Sec"
+                }
+            ]
+        },
+        {
+            "title": "GPU Memory Allocated (MB)",
+            "type": "gauge",
+            "datasource": {
+                "type": "prometheus",
+                "uid": "${DS_PROMETHEUS}"
+            },
+            "gridPos": {
+                "h": 8,
+                "w": 8,
+                "x": 8,
+                "y": 0
+            },
+            "targets": [
+                {
+                    "expr": "colorizer_gpu_memory_allocated_mb",
+                    "legendFormat": "VRAM Usage"
+                }
+            ]
+        },
+        {
+            "title": "Inference Latency (Milliseconds)",
+            "type": "timeseries",
+            "datasource": {
+                "type": "prometheus",
+                "uid": "${DS_PROMETHEUS}"
+            },
+            "gridPos": {
+                "h": 8,
+                "w": 16,
+                "x": 0,
+                "y": 8
+            },
+            "targets": [
+                {
+                    "expr": "rate(colorizer_inference_duration_seconds_sum[1m]) / rate(colorizer_inference_duration_seconds_count[1m]) * 1000",
+                    "legendFormat": "Average Latency (ms)"
+                }
+            ]
+        },
+        {
+            "title": "Active GPU Queue Size",
+            "type": "timeseries",
+            "datasource": {
+                "type": "prometheus",
+                "uid": "${DS_PROMETHEUS}"
+            },
+            "gridPos": {
+                "h": 8,
+                "w": 8,
+                "x": 16,
+                "y": 0
+            },
+            "targets": [
+                {
+                    "expr": "colorizer_inference_queue_size",
+                    "legendFormat": "Requests Waiting for Semaphore"
+                }
+            ]
+        }
+    ],
+    "schemaVersion": 38,
+    "style": "dark",
+    "tags": [
+        "AI",
+        "Colorizer",
+        "FastAPI",
+        "Prometheus"
+    ],
+    "templating": {
+        "list": []
+    },
+    "time": {
+        "from": "now-1h",
+        "to": "now"
+    },
+    "timepicker": {},
+    "timezone": "",
+    "title": "AI Colorization Telemetry",
+    "uid": "ai_telemetry_1",
+    "version": 1
+}
