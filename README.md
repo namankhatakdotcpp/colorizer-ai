@@ -1,11 +1,19 @@
-📸 DSLR AI Pipeline – End-to-End Computational Photography Engine
-🚀 Overview
+# 📸 DSLR AI Pipeline  
+### End-to-End Computational Photography Engine (Pure CNN)
 
-This project implements a multi-stage CNN-based DSLR simulation pipeline that transforms grayscale images into high-resolution, depth-aware, HDR-enhanced images.
+---
 
-The system is built using pure CNN architectures (no GAN dependency) and follows a curriculum training strategy across multiple modules.
+## 🚀 Overview
 
-🏗 Architecture Pipeline
+This project implements a **multi-stage CNN-based DSLR simulation pipeline** that transforms grayscale images into high-resolution, depth-aware, HDR-enhanced outputs.
+
+The system is designed using **pure convolutional architectures (no GAN dependency)** and follows a structured curriculum training strategy across multiple independent modules.
+
+The goal is to approximate DSLR-style image characteristics using deep learning and computational photography techniques.
+
+---
+
+## 🏗 Architecture Pipeline
 L Channel (256x256)
     ↓
 UNet Colorizer
@@ -21,94 +29,149 @@ Depth Estimation (MiDaS-style)
 Dynamic Filter Network (Depth-Aware Bokeh)
     ↓
 Final DSLR-like Output (1024x1024)
-🧠 Modules
-1️⃣ UNet Colorizer
 
-LAB color space prediction
+---
 
-L1 + Perceptual + SSIM loss
+## 🧠 Modules
 
-Mixed precision training
+### 1️⃣ UNet Colorizer
+- LAB color space prediction
+- Composite loss:
+  - L1 Loss
+  - Perceptual Loss (VGG16)
+  - SSIM Loss
+- Mixed precision training
+- Best-checkpoint saving with validation loop
 
-2️⃣ Super Resolution (RRDBNet)
+---
 
-4x upscaling
+### 2️⃣ Super Resolution (RRDBNet)
+- 4x upscaling (256 → 1024)
+- Residual-in-Residual Dense Blocks
+- PixelShuffle upscaling
+- Patch-based training
+- L1 + Perceptual Loss
+- PSNR-based checkpointing
 
-PixelShuffle architecture
+---
 
-Patch-based training
+### 3️⃣ Micro Contrast Enhancer
+- Residual CNN architecture
+- High-frequency enhancement
+- Laplacian & Sobel-based losses
+- Detail refinement without hallucination
 
-3️⃣ Micro Contrast Enhancer
+---
 
-Residual CNN
+### 4️⃣ Zero-DCE HDR Enhancement
+- 7-layer curve estimation network
+- Zero-reference training
+- Losses:
+  - Spatial Consistency
+  - Exposure Control
+  - Color Constancy
+  - Illumination Smoothness
 
-Laplacian & Sobel-based loss
+---
 
-4️⃣ Zero-DCE HDR
+### 5️⃣ Depth Estimation (MiDaS-style)
+- ResNet50 encoder
+- Multi-scale decoder
+- Scale-and-Shift Invariant Loss (SSIL)
+- Pretrained backbone fine-tuning
 
-Zero-reference curve-based enhancement
+---
 
-Spatial, exposure & color constancy losses
+### 6️⃣ Dynamic Filter Network (Bokeh Rendering)
+- Depth-aware separable kernel prediction
+- Edge-preserving blur
+- Sobel-based focus constraint
+- Patch-based optimization for memory efficiency
 
-5️⃣ Depth Estimation
+---
 
-ResNet50 encoder
+## 🏋️ Training Strategy
 
-Scale-and-shift invariant loss
+Each module is trained **independently** before sequential fine-tuning.
 
-6️⃣ Dynamic Filter Network
+Curriculum training avoids gradient collapse across the multi-stage pipeline.
 
-Depth-aware separable kernel prediction
+Training supports:
+- CUDA (NVIDIA GPUs)
+- Apple MPS
+- Mixed precision (autocast)
 
-Edge-preserving bokeh rendering
+---
 
-🖥 Tech Stack
+## 🖥 Tech Stack
 
-PyTorch
+- PyTorch
+- FastAPI
+- Docker
+- Async Worker Architecture (Planned)
+- Redis (Planned)
+- Mixed Precision Training
 
-FastAPI
+---
 
-Docker
+## 📦 Installation
 
-MPS / CUDA
+Clone the repository:
 
-Redis / Async Worker (Planned)
-
-🏋️ Training Strategy
-
-Each module is trained independently before sequential fine-tuning.
-
-Curriculum training prevents gradient explosion across the 6-stage pipeline.
-
-⚡ Deployment
-
-FastAPI acts as a lightweight API layer.
-Heavy inference runs in asynchronous GPU workers.
-
-📦 Installation
+```bash
 git clone https://github.com/YOUR_USERNAME/dslr-ai-pipeline.git
 cd dslr-ai-pipeline
+```
+## Install backend dependencies:
+
 pip install -r backend/requirements.txt
 
-Run:
+## Run with Docker:
 
 docker-compose up --build
-🎯 Current Status
 
-✅ ResNet18 baseline colorizer trained
+---
 
-🔄 Upgrading to UNet
+## 📊 Current Status
 
-🔜 Super Resolution module in progress
+- ✅ **Baseline ResNet18 Colorizer trained**
+- 🔄 **UNet Colorizer upgrade in progress**
+- 🔜 **Super Resolution module implementation**
+- 🔜 **Multi-stage inference integration**
 
-📈 Future Work
+---
 
-Patch-based DFN optimization
+## ⚠️ Notes
 
-Distributed training support
+- Model weights and datasets are not included in this repository.
+- Training the full 1024×1024 pipeline requires dedicated GPU hardware.
+- Designed for research and educational purposes.
 
-Model quantization for production
+---
 
-🧑‍💻 Author
+## 🎯 Project Goals
 
-Built as a deep learning research project focused on computational photography and DSLR simulation.
+- Simulate DSLR-style depth separation
+- Enhance micro-contrast and dynamic range
+- Maintain physically plausible image transformations
+- Build a modular, production-ready AI imaging pipeline
+
+---
+
+## 👨‍💻 Author
+
+Developed as an advanced deep learning research project focused on computational photography and multi-stage CNN systems.
+
+---
+
+## 📜 License
+
+MIT License
+
+---
+
+## 🖼 Sample Results
+
+| Input (Grayscale) | Output (Enhanced DSLR-style) |
+|-------------------|------------------------------|
+| ![input](assets/input.jpg) | ![output](assets/output.jpg) |
