@@ -328,3 +328,11 @@ Planned upgrades:
 **Naman**
 
 Built as a research project exploring computational photography pipelines and deep learning based image enhancement.
+
+---
+
+## 🧠 System Architecture
+
+The pipeline processes an image through four neural networks sequentially.
+
+![Pipeline](assets/pipeline.png)
