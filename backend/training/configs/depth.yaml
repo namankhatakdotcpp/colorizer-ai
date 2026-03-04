@@ -1,0 +1,26 @@
+# Depth Model Configuration
+experiment_name: "depth_dfn_v1"
+
+model:
+  type: "dfn"
+  params:
+    kernel_size: 11
+
+dataset:
+  train_path: "data/depth/train"
+  val_path: "data/depth/val"
+  img_size: 512
+  batch_size: 4
+
+training:
+  epochs: 40
+  learning_rate: 1.0e-4
+
+loss:
+  type: "bokeh"
+  params:
+    focus_threshold: 0.2
+
+optimizer:
+  type: "adam"
+  betas: [0.9, 0.999]

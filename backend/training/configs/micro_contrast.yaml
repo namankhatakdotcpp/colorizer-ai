@@ -1,0 +1,28 @@
+# Micro Contrast Enhancement Configuration
+experiment_name: "micro_contrast_v1"
+
+model:
+  type: "unet_contrast"
+  params:
+    in_channels: 3
+    out_channels: 3
+
+dataset:
+  train_path: "data/contrast/train"
+  val_path: "data/contrast/val"
+  img_size: 512
+  batch_size: 8
+
+training:
+  epochs: 100
+  learning_rate: 5.0e-5
+
+loss:
+  type: "ssim_l1"
+  params:
+    ssim_weight: 0.8
+    l1_weight: 0.2
+
+optimizer:
+  type: "adam"
+  betas: [0.9, 0.999]

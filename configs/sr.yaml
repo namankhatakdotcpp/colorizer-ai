@@ -1,0 +1,16 @@
+model:
+  name: rrdb_sr
+  scale: 4
+
+dataset:
+  name: div2k_flickr2k
+  hr_path: /datasets/div2k/
+  patch_size: 256
+
+training:
+  epochs: 200000
+  batch_size: 16
+
+loss:
+  l1_weight: 1.0
+  perceptual_weight: 0.1

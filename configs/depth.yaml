@@ -1,0 +1,16 @@
+model:
+  name: dfn_depth
+  params:
+    kernel_size: 11
+    
+dataset:
+  name: bokeh_stereo
+  path: /datasets/depth/
+  image_size: 512
+
+training:
+  epochs: 40
+  batch_size: 4
+
+loss:
+  focus_threshold: 0.2

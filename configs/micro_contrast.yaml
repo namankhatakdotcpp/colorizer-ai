@@ -1,0 +1,14 @@
+model:
+  name: micro_contrast
+
+dataset:
+  name: enhanced_dataset
+  path: /datasets/enhance/
+
+training:
+  epochs: 30
+  batch_size: 16
+
+loss:
+  laplacian_weight: 0.5
+  gradient_weight: 0.5

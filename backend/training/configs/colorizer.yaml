@@ -1,0 +1,31 @@
+# Colorizer Configuration
+# Inherits from default.yaml conceptually in the loader
+experiment_name: "colorizer_unet_v1"
+
+model:
+  type: "unet"
+  params:
+    in_channels: 1
+    out_channels: 2
+
+dataset:
+  train_path: "data/colorization/train"
+  val_path: "data/colorization/val"
+  img_size: 256
+  batch_size: 32
+
+training:
+  epochs: 200
+  learning_rate: 2.0e-4
+  mixed_precision: true
+
+loss:
+  type: "hybrid_colorization"
+  params:
+    l1_weight: 1.0
+    vgg_weight: 0.1
+    ssim_weight: 0.5
+
+optimizer:
+  type: "adam"
+  betas: [0.9, 0.999]

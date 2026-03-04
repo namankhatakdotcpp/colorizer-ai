@@ -1,0 +1,28 @@
+# Super Resolution Configuration
+experiment_name: "sr_esrgan_v1"
+
+model:
+  type: "rrdb"
+  params:
+    in_channels: 3
+    out_channels: 3
+    num_features: 64
+    num_blocks: 23
+
+dataset:
+  train_path: "data/sr/train"
+  val_path: "data/sr/val"
+  img_size: 512 # HR size
+  batch_size: 8
+
+training:
+  epochs: 150
+  learning_rate: 1.0e-4
+
+loss:
+  type: "esrgan_hybrid"
+  params:
+    l1_weight: 0.01
+    vgg_weight: 1.0
+    gan_weight: 0.005
+    use_gan: true
