@@ -1,177 +1,330 @@
-# 📸 DSLR AI Pipeline  
-### End-to-End Computational Photography Engine (Pure CNN)
+# Colorizer-AI 🎨📸
+
+**A Computational Photography Pipeline for Image Colorization and Enhancement**
+
+Colorizer-AI is a deep learning pipeline that converts black-and-white images into high-quality, high-resolution, DSLR-style images using a sequence of specialized neural networks.
+
+The system performs:
+
+* 🎨 Image Colorization
+* 🔍 Super Resolution (4× Upscaling)
+* 🧠 Depth Estimation
+* ✨ Micro-Contrast Enhancement
+
+The pipeline is designed to mimic a **modern AI Image Signal Processor (ISP)** similar to those used in smartphone computational photography systems.
 
 ---
 
-## 🚀 Overview
+# 🚀 Pipeline Overview
 
-This project implements a **multi-stage CNN-based DSLR simulation pipeline** that transforms grayscale images into high-resolution, depth-aware, HDR-enhanced outputs.
+Input grayscale image passes through four models sequentially:
 
-The system is designed using **pure convolutional architectures (no GAN dependency)** and follows a structured curriculum training strategy across multiple independent modules.
-
-The goal is to approximate DSLR-style image characteristics using deep learning and computational photography techniques.
-
----
-
-## 🏗 Architecture Pipeline
-L Channel (256x256)
-    ↓
-UNet Colorizer
-    ↓
-RRDB Super Resolution (4x)
-    ↓
-Micro-Contrast Enhancement
-    ↓
-Zero-DCE HDR Enhancement
-    ↓
-Depth Estimation (MiDaS-style)
-    ↓
-Dynamic Filter Network (Depth-Aware Bokeh)
-    ↓
-Final DSLR-like Output (1024x1024)
-
----
-
-## 🧠 Modules
-
-### 1️⃣ UNet Colorizer
-- LAB color space prediction
-- Composite loss:
-  - L1 Loss
-  - Perceptual Loss (VGG16)
-  - SSIM Loss
-- Mixed precision training
-- Best-checkpoint saving with validation loop
-
----
-
-### 2️⃣ Super Resolution (RRDBNet)
-- 4x upscaling (256 → 1024)
-- Residual-in-Residual Dense Blocks
-- PixelShuffle upscaling
-- Patch-based training
-- L1 + Perceptual Loss
-- PSNR-based checkpointing
-
----
-
-### 3️⃣ Micro Contrast Enhancer
-- Residual CNN architecture
-- High-frequency enhancement
-- Laplacian & Sobel-based losses
-- Detail refinement without hallucination
-
----
-
-### 4️⃣ Zero-DCE HDR Enhancement
-- 7-layer curve estimation network
-- Zero-reference training
-- Losses:
-  - Spatial Consistency
-  - Exposure Control
-  - Color Constancy
-  - Illumination Smoothness
-
----
-
-### 5️⃣ Depth Estimation (MiDaS-style)
-- ResNet50 encoder
-- Multi-scale decoder
-- Scale-and-Shift Invariant Loss (SSIL)
-- Pretrained backbone fine-tuning
-
----
-
-### 6️⃣ Dynamic Filter Network (Bokeh Rendering)
-- Depth-aware separable kernel prediction
-- Edge-preserving blur
-- Sobel-based focus constraint
-- Patch-based optimization for memory efficiency
-
----
-
-## 🏋️ Training Strategy
-
-Each module is trained **independently** before sequential fine-tuning.
-
-Curriculum training avoids gradient collapse across the multi-stage pipeline.
-
-Training supports:
-- CUDA (NVIDIA GPUs)
-- Apple MPS
-- Mixed precision (autocast)
-
----
-
-## 🖥 Tech Stack
-
-- PyTorch
-- FastAPI
-- Docker
-- Async Worker Architecture (Planned)
-- Redis (Planned)
-- Mixed Precision Training
-
----
-
-## 📦 Installation
-
-Clone the repository:
-
-```bash
-git clone https://github.com/YOUR_USERNAME/dslr-ai-pipeline.git
-cd dslr-ai-pipeline
 ```
-## Install backend dependencies:
-
-pip install -r backend/requirements.txt
-
-## Run with Docker:
-
-docker-compose up --build
-
----
-
-## 📊 Current Status
-
-- ✅ **Baseline ResNet18 Colorizer trained**
-- 🔄 **UNet Colorizer upgrade in progress**
-- 🔜 **Super Resolution module implementation**
-- 🔜 **Multi-stage inference integration**
-
----
-
-## ⚠️ Notes
-
-- Model weights and datasets are not included in this repository.
-- Training the full 1024×1024 pipeline requires dedicated GPU hardware.
-- Designed for research and educational purposes.
-
----
-
-## 🎯 Project Goals
-
-- Simulate DSLR-style depth separation
-- Enhance micro-contrast and dynamic range
-- Maintain physically plausible image transformations
-- Build a modular, production-ready AI imaging pipeline
+Grayscale Image
+        │
+        ▼
+┌────────────────────┐
+│  UNet Colorizer    │
+│  (L → AB channels) │
+└─────────┬──────────┘
+          ▼
+┌────────────────────┐
+│ RRDB SuperRes      │
+│ (4× Upscaling)     │
+└─────────┬──────────┘
+          ▼
+┌────────────────────┐
+│ Depth Estimation   │
+│ (Dynamic Filter)   │
+└─────────┬──────────┘
+          ▼
+┌────────────────────┐
+│ Micro Contrast Net │
+│ Edge Enhancement   │
+└─────────┬──────────┘
+          ▼
+     Final Image
+```
 
 ---
 
-## 👨‍💻 Author
+# 🧠 Models Used
 
-Developed as an advanced deep learning research project focused on computational photography and multi-stage CNN systems.
+## 1️⃣ Colorizer
+
+* Architecture: **UNet**
+* Input: L channel (grayscale)
+* Output: AB color channels
+* Loss:
+
+  * L1
+  * VGG Perceptual
+  * SSIM
+
+Dataset:
+
+* COCO
+* Places365
 
 ---
 
-## 📜 License
+## 2️⃣ Super Resolution
 
-MIT License
+* Architecture: **RRDB (ESRGAN style)**
+* Upscaling: **4×**
+
+Training Strategy:
+
+* HR images → RandomCrop(256)
+* Bicubic downscale → LR images
+
+Dataset:
+
+* DIV2K
+* Flickr2K
+
+Loss:
+
+* L1
+* Perceptual Loss
+* GAN (optional)
 
 ---
 
-## 🖼 Sample Results
+## 3️⃣ Depth Estimation
 
-| Input (Grayscale) | Output (Enhanced DSLR-style) |
-|-------------------|------------------------------|
-| ![input](assets/input.jpg) | ![output](assets/output.jpg) |
+* Architecture: **Dynamic Filter Network**
+* Predicts depth maps from RGB images
+
+Used for:
+
+* Scene understanding
+* Spatial feature enhancement
+
+---
+
+## 4️⃣ Micro-Contrast Enhancement
+
+Enhances:
+
+* local gradients
+* edges
+* textures
+
+Creates DSLR-style sharpness.
+
+---
+
+# 📂 Repository Structure
+
+```
+colorizer-ai/
+
+configs/
+    colorizer.yaml
+    sr.yaml
+    depth.yaml
+    micro_contrast.yaml
+
+datasets/
+    dataset_colorizer.py
+    dataset_sr.py
+    preprocess_lab.py
+    scripts/download_datasets.sh
+
+models/
+    unet_colorizer.py
+    rrdb_sr.py
+    depth_model.py
+    micro_contrast_model.py
+
+training/
+    train.py
+    train_colorizer.py
+    train_sr.py
+    train_depth.py
+    train_micro_contrast.py
+
+utils/
+    config_loader.py
+    losses.py
+    tracker.py
+
+run_stage.sh
+run_training.sh
+inference_pipeline.py
+ARCHITECTURE.md
+SETUP.md
+```
+
+---
+
+# 📦 Dataset Setup
+
+Download datasets automatically:
+
+```
+./datasets/scripts/download_datasets.sh
+```
+
+Datasets used:
+
+| Dataset   | Purpose          |
+| --------- | ---------------- |
+| COCO      | colorization     |
+| Places365 | colorization     |
+| DIV2K     | super resolution |
+| Flickr2K  | super resolution |
+
+Total size: **~50GB**
+
+---
+
+# ⚡ Preprocess LAB Dataset
+
+Before training the colorizer:
+
+```
+python datasets/preprocess_lab.py
+```
+
+This converts RGB images to:
+
+```
+L channel
+AB channels
+```
+
+This speeds up training **2-3×**.
+
+---
+
+# 🏋️ Training Models
+
+Train models **in this order**:
+
+### 1️⃣ Colorizer
+
+```
+./run_stage.sh colorizer
+```
+
+### 2️⃣ Super Resolution
+
+```
+./run_stage.sh sr
+```
+
+### 3️⃣ Depth Estimation
+
+```
+./run_stage.sh depth
+```
+
+### 4️⃣ Micro Contrast
+
+```
+./run_stage.sh contrast
+```
+
+---
+
+# 🖥 Multi-GPU Training
+
+The project supports **Distributed Data Parallel (DDP)**.
+
+Example:
+
+```
+torchrun --nproc_per_node=8 train.py
+```
+
+Optimizations included:
+
+* Mixed Precision (AMP)
+* Gradient Accumulation
+* Distributed Samplers
+* Optimized DataLoaders
+
+---
+
+# 🖼 Inference
+
+Run the complete pipeline on an image:
+
+```
+python inference_pipeline.py path/to/image.jpg
+```
+
+Output will be saved to:
+
+```
+outputs/
+```
+
+---
+
+# 🧪 Hardware
+
+The pipeline is optimized for:
+
+```
+8 × NVIDIA RTX A6000
+48GB VRAM each
+```
+
+Training speed estimate:
+
+| Model            | Time    |
+| ---------------- | ------- |
+| Colorizer        | 3-4 hrs |
+| Super Resolution | 6-8 hrs |
+| Depth            | ~2 hrs  |
+| Micro Contrast   | ~2 hrs  |
+
+---
+
+# 📊 Metrics
+
+Models are evaluated using:
+
+* PSNR
+* SSIM
+* LPIPS
+
+Training progress is tracked with **TensorBoard**.
+
+---
+
+# 📜 Documentation
+
+Detailed architecture explanation:
+
+```
+ARCHITECTURE.md
+```
+
+Environment setup guide:
+
+```
+SETUP.md
+```
+
+---
+
+# 🎯 Future Improvements
+
+Planned upgrades:
+
+* SwinIR Super Resolution
+* Diffusion Colorization
+* Real-time inference
+* GAN texture synthesis
+
+---
+
+# 👨‍💻 Author
+
+**Naman**
+
+Built as a research project exploring computational photography pipelines and deep learning based image enhancement.
