@@ -20,7 +20,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN python3.11 -m venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
 
-COPY requirements.txt .
+COPY backend/requirements.txt .
 
 # Install dependencies into the completely isolated virtual environment
 # We use --no-cache-dir because the builder layer size doesn't strictly matter
@@ -37,6 +37,7 @@ FROM nvidia/cuda:11.8.0-cudnn8-runtime-ubuntu22.04
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PATH="/opt/venv/bin:$PATH" \
+    PYTHONPATH="/app:/app/backend" \
     PORT=8000 \
     WORKERS=1
 
@@ -72,5 +73,5 @@ USER fastapi
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
     CMD curl -f http://localhost:8000/health || exit 1
 
-# Execute the ASGI server. Uvicorn dynamically binds to the PORT env variable automatically.
-CMD uvicorn app.main:app --host 0.0.0.0 --port ${PORT} --workers ${WORKERS} --proxy-headers
+# Execute the ASGI server using the backend package root on PYTHONPATH.
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]

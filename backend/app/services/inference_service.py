@@ -1,6 +1,4 @@
 import io
-import sys
-import os
 import torch
 import numpy as np
 import logging
@@ -12,9 +10,7 @@ with warnings.catch_warnings():
     warnings.simplefilter("ignore")
     from skimage.color import rgb2lab, lab2rgb
 
-# Import new ResNet model from the training package
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../")))
-from training.model import ResNetColorizer
+from models.unet_colorizer import UNetColorizer
 
 logger = logging.getLogger(__name__)
 
@@ -25,7 +21,7 @@ class InferenceService:
         # Performance requirement: Keep inference on exactly 2 CPU threads
         torch.set_num_threads(2)
         
-        self.model = ResNetColorizer()
+        self.model = UNetColorizer(in_channels=1, out_channels=2)
         
         # Load the checkpoint generated from Phase 2
         from app.config import settings
@@ -34,7 +30,7 @@ class InferenceService:
             # We must load map_location CPU safely
             state_dict = torch.load(model_path, map_location=self.device)
             self.model.load_state_dict(state_dict)
-            logger.info("Successfully loaded ResNet18 Colorizer weights!")
+            logger.info("Successfully loaded UNet Colorizer weights!")
             # 🔎 VERIFY EXACT WEIGHTS FILE
             import hashlib
 

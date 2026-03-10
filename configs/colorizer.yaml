@@ -9,7 +9,7 @@ dataset:
   image_size: 256
 
 training:
-  epochs: 40
+  epochs: 250
   batch_size: 64
 
 loss:

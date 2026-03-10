@@ -101,9 +101,10 @@ def main():
     img_size = config['dataset']['img_size']
     batch_size = config['dataset']['batch_size']
     
-    # Ideally link your specific Datasets here based on config['model']['type']
-    train_dataset = DummyDataset(1000, img_size)
-    val_dataset = DummyDataset(100, img_size)
+    from datasets.dataset_colorizer import ColorizationDataset
+
+    train_dataset = ColorizationDataset("dataset_lab")
+    val_dataset = ColorizationDataset("dataset_lab")
     
     train_sampler = DistributedSampler(train_dataset, shuffle=True)
     val_sampler = DistributedSampler(val_dataset, shuffle=False)

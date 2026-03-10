@@ -69,6 +69,6 @@ def setup_logging():
     
     # Silence third-party noise
     logging.getLogger("uvicorn.access").disabled = True
-    logging.getLogger("uvicorn.error").setLevel(logging.WARNING)
+    logging.getLogger("uvicorn.error").setLevel(logging.INFO)
     
     logger.info("Structured JSON logging initialized.")

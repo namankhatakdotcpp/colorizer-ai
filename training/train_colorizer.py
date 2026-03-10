@@ -16,8 +16,8 @@ from utils.tracker import ModelTracker
 
 def main():
     parser = argparse.ArgumentParser(description="Stage 1: Colorizer Pipeline")
-    parser.add_argument("--epochs", type=int, default=50)
-    parser.add_argument("--batch_size", type=int, default=32)
+    parser.add_argument("--epochs", type=int, default=250)
+    parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--lr", type=float, default=1e-4)
     args = parser.parse_args()
 
@@ -35,15 +35,20 @@ def main():
     torch.backends.cudnn.allow_tf32 = True
 
     # 2. Stage-Specific Dataset
-    train_dataset = ColorizationDataset(root_dir="data/colorization/train")
+    train_dataset = ColorizationDataset(root_dir="datasets/flickr2k")
+
     train_sampler = DistributedSampler(train_dataset, shuffle=True)
-    
-    # Scale workers safely across multi-GPU
     num_workers = min(8, os.cpu_count() // world_size)
     train_loader = DataLoader(
-        train_dataset, batch_size=args.batch_size, sampler=train_sampler,
-        num_workers=num_workers, pin_memory=True, persistent_workers=True
+    train_dataset,
+        batch_size=args.batch_size,
+        sampler=train_sampler,
+        num_workers=num_workers,
+        pin_memory=True,
+        persistent_workers=True
     )
+
+
 
     # 3. Model, Loss, Optimizer
     model = UNetColorizer(in_channels=1, out_channels=2).to(device)
