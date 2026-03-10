@@ -1,25 +1,74 @@
 #!/usr/bin/env bash
+set -euo pipefail
 
-# PyTorch Distributed Data Parallel Launcher
-# Optimally configured to spawn NCCL-linked training engines across 8 GPUs natively via torchrun.
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$ROOT_DIR"
 
-# Strict bash constraints
-set -e
+CHECKPOINT_DIR="${CHECKPOINT_DIR:-checkpoints}"
+COLORIZER_DATA_DIR="${COLORIZER_DATA_DIR:-datasets/flickr2k}"
+RGB_INPUT_DIR="${RGB_INPUT_DIR:-datasets/flickr2k/rgb}"
 
-# Default to the primary config if none provided mathematically via terminal argument
-CONFIG_PATH=${1:-"configs/default.yaml"}
+STAGE1_EPOCHS="${STAGE1_EPOCHS:-100}"
+STAGE2_EPOCHS="${STAGE2_EPOCHS:-20}"
+STAGE3_EPOCHS="${STAGE3_EPOCHS:-20}"
+STAGE4_EPOCHS="${STAGE4_EPOCHS:-20}"
 
-echo "====================================================================="
-echo "Initializing PyTorch Distributed Training Sequence (DDP)"
-echo "Targeting 8 GPU Node Topology..."
-echo "Applying Configuration Profile: $CONFIG_PATH"
-echo "====================================================================="
+if [[ -n "${CUDA_VISIBLE_DEVICES:-}" ]]; then
+  NPROC_PER_NODE=$(echo "$CUDA_VISIBLE_DEVICES" | awk -F',' '{print NF}')
+else
+  NPROC_PER_NODE="${NPROC_PER_NODE:-4}"
+fi
 
-# Torchrun is the official PyTorch elastic launcher replacing torch.distributed.launch
-# It automatically provisions LOCAL_RANK, RANK, and WORLD_SIZE environment variables internally to train.py
+export PYTHONPATH="${PYTHONPATH:-.}"
 
-torchrun \
-    --standalone \
-    --nnodes=1 \
-    --nproc_per_node=8 \
-    training/train.py --config "$CONFIG_PATH"
+echo "[1/6] Preprocessing LAB dataset"
+if [[ ! -d "${COLORIZER_DATA_DIR}/L" || ! -d "${COLORIZER_DATA_DIR}/AB" ]]; then
+  if [[ ! -d "$RGB_INPUT_DIR" ]]; then
+    echo "ERROR: RGB_INPUT_DIR not found: $RGB_INPUT_DIR"
+    echo "Place RGB training images there, or set RGB_INPUT_DIR to your dataset path."
+    exit 1
+  fi
+  python datasets/preprocess_lab.py --input-dir "$RGB_INPUT_DIR" --output-dir "$COLORIZER_DATA_DIR" --img-size 256
+else
+  echo "Found preprocessed dataset at ${COLORIZER_DATA_DIR}/L and ${COLORIZER_DATA_DIR}/AB"
+fi
+
+echo "[2/6] Stage 1 - Colorizer training"
+torchrun --standalone --nnodes=1 --nproc_per_node="$NPROC_PER_NODE" \
+  training/train_colorizer.py \
+  --epochs "$STAGE1_EPOCHS" \
+  --data-root "$COLORIZER_DATA_DIR" \
+  --checkpoint-dir "$CHECKPOINT_DIR"
+
+echo "[3/6] Verify stage1 checkpoint size"
+CHECKPOINT_DIR_ENV="$CHECKPOINT_DIR" python - <<'PY'
+import os
+from pathlib import Path
+p = Path(os.environ["CHECKPOINT_DIR_ENV"]) / "stage1_colorizer_latest.pth"
+if not p.exists():
+    raise SystemExit("ERROR: missing stage1 checkpoint")
+size_mb = p.stat().st_size / (1024 * 1024)
+print(f"stage1 checkpoint size: {size_mb:.2f} MB")
+if not (80 <= size_mb <= 150):
+    print("WARNING: checkpoint size outside expected 80MB-150MB range")
+PY
+
+echo "[4/6] Stage 2 - Super Resolution training"
+torchrun --standalone --nnodes=1 --nproc_per_node="$NPROC_PER_NODE" \
+  training/train_sr.py \
+  --epochs "$STAGE2_EPOCHS" \
+  --checkpoint-dir "$CHECKPOINT_DIR"
+
+echo "[5/6] Stage 3 - Depth training"
+torchrun --standalone --nnodes=1 --nproc_per_node="$NPROC_PER_NODE" \
+  training/train_depth.py \
+  --epochs "$STAGE3_EPOCHS" \
+  --checkpoint-dir "$CHECKPOINT_DIR"
+
+echo "[6/6] Stage 4 - Contrast training"
+torchrun --standalone --nnodes=1 --nproc_per_node="$NPROC_PER_NODE" \
+  training/train_micro_contrast.py \
+  --epochs "$STAGE4_EPOCHS" \
+  --checkpoint-dir "$CHECKPOINT_DIR"
+
+echo "Training pipeline completed."

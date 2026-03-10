@@ -28,7 +28,8 @@ class InferenceService:
         model_path = settings.MODEL_WEIGHTS_PATH
         try:
             # We must load map_location CPU safely
-            state_dict = torch.load(model_path, map_location=self.device)
+            checkpoint = torch.load(model_path, map_location=self.device)
+            state_dict = checkpoint.get("model_state_dict", checkpoint)
             self.model.load_state_dict(state_dict)
             logger.info("Successfully loaded UNet Colorizer weights!")
             # 🔎 VERIFY EXACT WEIGHTS FILE

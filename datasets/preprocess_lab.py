@@ -1,82 +1,80 @@
+import argparse
+import hashlib
 import os
-import glob
+from pathlib import Path
+from typing import List
+
 import numpy as np
 from PIL import Image
-from skimage import color
-from pathlib import Path
-from tqdm import tqdm
+from skimage.color import rgb2lab
+try:
+    from tqdm import tqdm
+except ImportError:  # pragma: no cover - fallback for minimal environments
+    def tqdm(iterable, **kwargs):
+        return iterable
 
-def preprocess_images_to_lab(input_dir, output_dir, img_size=(256, 256)):
-    """
-    Converts RGB images to LAB color space and saves L (lightness) and ab (color) 
-    channels separately as fast-loading numpy arrays.
-    
-    Args:
-        input_dir (str): Directory containing source RGB images.
-        output_dir (str): Directory to save the preprocessed numpy arrays.
-        img_size (tuple): Target resize dimensions (width, height) before conversion.
-    """
-    # Create output directories for L and ab channels
-    l_dir = os.path.join(output_dir, 'L')
-    ab_dir = os.path.join(output_dir, 'AB')
-    os.makedirs(l_dir, exist_ok=True)
-    os.makedirs(ab_dir, exist_ok=True)
-    
-    # Find all images in input directory
-    image_paths = []
-    for ext in ('*.jpg', '*.jpeg', '*.png'):
-        image_paths.extend(glob.glob(os.path.join(input_dir, '**', ext), recursive=True))
-        
+
+def _discover_images(input_dir: Path) -> List[Path]:
+    patterns = ("*.jpg", "*.jpeg", "*.png", "*.bmp", "*.webp")
+    images: List[Path] = []
+    for pattern in patterns:
+        images.extend(input_dir.rglob(pattern))
+    return sorted(images)
+
+
+def _stable_name(path: Path, root: Path) -> str:
+    # Deterministic filename safe for nested folders and duplicate basenames.
+    rel = str(path.relative_to(root)).replace(os.sep, "_")
+    digest = hashlib.md5(rel.encode("utf-8")).hexdigest()[:10]
+    stem = Path(rel).stem
+    return f"{stem}_{digest}"
+
+
+def preprocess_images_to_lab(input_dir: Path, output_dir: Path, img_size: int = 256) -> int:
+    l_dir = output_dir / "L"
+    ab_dir = output_dir / "AB"
+    l_dir.mkdir(parents=True, exist_ok=True)
+    ab_dir.mkdir(parents=True, exist_ok=True)
+
+    image_paths = _discover_images(input_dir)
     if not image_paths:
-        print(f"No images found in {input_dir}")
-        return
-        
-    print(f"Found {len(image_paths)} images. Starting preprocessing...")
-    
-    for img_path in tqdm(image_paths, desc="Converting RGB to LAB"):
-        try:
-            # Load and resize RGB image
-            img = Image.open(img_path).convert('RGB')
-            img = img.resize(img_size, Image.BICUBIC)
-            
-            # Convert PIL image to numpy array (H, W, 3) in [0, 255]
-            img_np = np.array(img)
-            
-            # Convert RGB to LAB using skimage
-            # Note: skimage color.rgb2lab expects RGB in [0, 255] or [0, 1]
-            # It returns L in [0, 100] and a,b roughly in [-128, 127]
-            lab = color.rgb2lab(img_np)
-            
-            # Extract L and ab channels
-            l_channel = lab[:, :, 0] # Shape: (H, W)
-            ab_channel = lab[:, :, 1:] # Shape: (H, W, 2)
-            
-            # Get base filename without extension
-            base_filename = Path(img_path).stem
-            
-            # Save as numpy arrays (.npy)
-            # This is much faster to load during PyTorch training than reading JPEGs and converting on the fly
-            np.save(os.path.join(l_dir, f"{base_filename}.npy"), l_channel.astype(np.float32))
-            np.save(os.path.join(ab_dir, f"{base_filename}.npy"), ab_channel.astype(np.float32))
-            
-        except Exception as e:
-            print(f"\nError processing {img_path}: {e}")
-            
-    print(f"Preprocessing complete. Saved L and ab channels to {output_dir}")
+        raise FileNotFoundError(
+            f"No images found under {input_dir}. Please place RGB images before preprocessing."
+        )
+
+    for img_path in tqdm(image_paths, desc="RGB -> LAB", unit="img"):
+        rgb = Image.open(img_path).convert("RGB")
+        rgb = rgb.resize((img_size, img_size), Image.Resampling.BICUBIC)
+
+        # rgb2lab is deterministic for fixed input.
+        rgb_np = np.asarray(rgb, dtype=np.float32) / 255.0
+        lab = rgb2lab(rgb_np)
+
+        l_channel = lab[:, :, 0].astype(np.float32)
+        ab_channel = lab[:, :, 1:].astype(np.float32)
+
+        base = _stable_name(img_path, input_dir)
+        np.save(l_dir / f"{base}.npy", l_channel)
+        np.save(ab_dir / f"{base}.npy", ab_channel)
+
+    return len(image_paths)
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Deterministic RGB to LAB preprocessing")
+    parser.add_argument("--input-dir", type=Path, required=True, help="Directory with source RGB images")
+    parser.add_argument("--output-dir", type=Path, default=Path("dataset_lab"), help="Output directory")
+    parser.add_argument("--img-size", type=int, default=256, help="Resize dimension (square)")
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    count = preprocess_images_to_lab(args.input_dir, args.output_dir, args.img_size)
+    print(f"Processed {count} images")
+    print(f"Output: {args.output_dir / 'L'}")
+    print(f"Output: {args.output_dir / 'AB'}")
+
 
 if __name__ == "__main__":
-    # Example usage:
-    # Set your input directory containing original RGB training images
-    input_images_dir = "data/colorization/rgb_images"
-    
-    # Set your output directory for the fast-loading numpy arrays
-    output_numpy_dir = "dataset_lab"
-    
-    # Create dummy dir for example if it doesn't exist
-    os.makedirs(input_images_dir, exist_ok=True)
-    
-    preprocess_images_to_lab(
-        input_dir=input_images_dir,
-        output_dir=output_numpy_dir,
-        img_size=(256, 256)
-    )
+    main()

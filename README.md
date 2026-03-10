@@ -336,3 +336,75 @@ Built as a research project exploring computational photography pipelines and de
 The pipeline processes an image through four neural networks sequentially.
 
 ![Pipeline](assets/pipeline.png)
+
+## Training, Resume, and Inference (DDP)
+
+### Train full pipeline with one command
+
+```bash
+PYTHONPATH=. CUDA_VISIBLE_DEVICES=0,1,2,3 ./run_training.sh
+```
+
+This runs:
+1. LAB preprocessing
+2. Stage 1 colorizer training
+3. Stage 1 checkpoint size verification
+4. Stage 2 SR training
+5. Stage 3 depth training
+6. Stage 4 contrast training
+
+### Resume training
+
+All stage trainers auto-resume when `*_latest.pth` exists in `checkpoints/`.
+
+Examples:
+
+```bash
+torchrun --standalone --nnodes=1 --nproc_per_node=4 training/train_colorizer.py
+```
+
+```bash
+torchrun --standalone --nnodes=1 --nproc_per_node=4 training/train_sr.py
+```
+
+### Dataset format for colorizer
+
+Expected preprocessed structure:
+
+```text
+datasets/flickr2k/
+  L/
+  AB/
+```
+
+To generate it from RGB images:
+
+```bash
+python datasets/preprocess_lab.py --input-dir datasets/flickr2k/rgb --output-dir datasets/flickr2k --img-size 256
+```
+
+### Inference
+
+Single-stage colorization:
+
+```bash
+python inference_pipeline.py test.jpg
+```
+
+Output:
+
+```text
+outputs/colorized_test.jpg
+```
+
+Optional full pipeline (if stage2/3/4 checkpoints exist):
+
+```bash
+python inference_pipeline.py test.jpg --full-pipeline
+```
+
+### Pipeline smoke test
+
+```bash
+python scripts/test_pipeline.py --image test.jpg
+```

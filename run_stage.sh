@@ -3,15 +3,24 @@
 # Top-level execution wrapper for the Modular Multi-Stage Pipeline
 
 # Strict bash constraints
-set -e
+set -euo pipefail
 
 STAGE=${1:-"colorizer"}
 
 echo "====================================================================="
 echo "Initializing PyTorch Distributed Training Sequence (DDP)"
-echo "Targeting 8 GPU Node Topology..."
 echo "Executing Stage: $STAGE"
 echo "====================================================================="
+
+if [ -n "${CUDA_VISIBLE_DEVICES:-}" ]; then
+    NPROC_PER_NODE=$(echo "$CUDA_VISIBLE_DEVICES" | awk -F',' '{print NF}')
+else
+    NPROC_PER_NODE=${NPROC_PER_NODE:-4}
+fi
+
+export PYTHONPATH="${PYTHONPATH:-.}"
+
+echo "Targeting ${NPROC_PER_NODE} GPU process(es)..."
 
 if [ "$STAGE" == "colorizer" ]; then
     H_SCRIPT="training/train_colorizer.py"
@@ -29,5 +38,5 @@ fi
 torchrun \
     --standalone \
     --nnodes=1 \
-    --nproc_per_node=8 \
+    --nproc_per_node="$NPROC_PER_NODE" \
     $H_SCRIPT
