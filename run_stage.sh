@@ -24,12 +24,16 @@ echo "Targeting ${NPROC_PER_NODE} GPU process(es)..."
 
 if [ "$STAGE" == "colorizer" ]; then
     H_SCRIPT="training/train_colorizer.py"
+    DATA_ROOT="${COLORIZER_DATA_DIR:-datasets/flickr2k}"
 elif [ "$STAGE" == "sr" ]; then
     H_SCRIPT="training/train_sr.py"
+    DATA_ROOT="${SR_DATA_DIR:-datasets/div2k}"
 elif [ "$STAGE" == "depth" ]; then
     H_SCRIPT="training/train_depth.py"
+    DATA_ROOT="${DEPTH_DATA_DIR:-datasets/coco}"
 elif [ "$STAGE" == "contrast" ]; then
     H_SCRIPT="training/train_micro_contrast.py"
+    DATA_ROOT="${CONTRAST_DATA_DIR:-datasets/flickr2k}"
 else
     echo "Invalid Stage specified. Choose: colorizer, sr, depth, contrast"
     exit 1
@@ -39,4 +43,4 @@ torchrun \
     --standalone \
     --nnodes=1 \
     --nproc_per_node="$NPROC_PER_NODE" \
-    $H_SCRIPT
+    $H_SCRIPT --data-root "$DATA_ROOT"

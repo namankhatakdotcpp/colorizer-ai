@@ -7,6 +7,9 @@ cd "$ROOT_DIR"
 CHECKPOINT_DIR="${CHECKPOINT_DIR:-checkpoints}"
 COLORIZER_DATA_DIR="${COLORIZER_DATA_DIR:-datasets/flickr2k}"
 RGB_INPUT_DIR="${RGB_INPUT_DIR:-datasets/flickr2k/rgb}"
+SR_DATA_DIR="${SR_DATA_DIR:-datasets/div2k}"
+DEPTH_DATA_DIR="${DEPTH_DATA_DIR:-datasets/coco}"
+CONTRAST_DATA_DIR="${CONTRAST_DATA_DIR:-datasets/flickr2k}"
 
 STAGE1_EPOCHS="${STAGE1_EPOCHS:-100}"
 STAGE2_EPOCHS="${STAGE2_EPOCHS:-20}"
@@ -49,26 +52,29 @@ if not p.exists():
     raise SystemExit("ERROR: missing stage1 checkpoint")
 size_mb = p.stat().st_size / (1024 * 1024)
 print(f"stage1 checkpoint size: {size_mb:.2f} MB")
-if not (80 <= size_mb <= 150):
-    print("WARNING: checkpoint size outside expected 80MB-150MB range")
+if size_mb < 20:
+    raise SystemExit("ERROR: stage1 checkpoint too small (<20MB)")
 PY
 
 echo "[4/6] Stage 2 - Super Resolution training"
 torchrun --standalone --nnodes=1 --nproc_per_node="$NPROC_PER_NODE" \
   training/train_sr.py \
   --epochs "$STAGE2_EPOCHS" \
+  --data-root "$SR_DATA_DIR" \
   --checkpoint-dir "$CHECKPOINT_DIR"
 
 echo "[5/6] Stage 3 - Depth training"
 torchrun --standalone --nnodes=1 --nproc_per_node="$NPROC_PER_NODE" \
   training/train_depth.py \
   --epochs "$STAGE3_EPOCHS" \
+  --data-root "$DEPTH_DATA_DIR" \
   --checkpoint-dir "$CHECKPOINT_DIR"
 
 echo "[6/6] Stage 4 - Contrast training"
 torchrun --standalone --nnodes=1 --nproc_per_node="$NPROC_PER_NODE" \
   training/train_micro_contrast.py \
   --epochs "$STAGE4_EPOCHS" \
+  --data-root "$CONTRAST_DATA_DIR" \
   --checkpoint-dir "$CHECKPOINT_DIR"
 
 echo "Training pipeline completed."

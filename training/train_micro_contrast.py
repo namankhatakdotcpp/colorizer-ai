@@ -1,23 +1,62 @@
 import argparse
 import os
+import time
 from pathlib import Path
+from typing import List
 
+from PIL import Image
 import torch
 import torch.distributed as dist
 import torch.optim as optim
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, Dataset
 from torch.utils.data.distributed import DistributedSampler
+import torchvision.transforms.functional as TF
 
 from models.micro_contrast_model import MicroContrastModel
 
 
+STAGE_NAME = "stage4_contrast"
+ALLOWED_DATASET_TOKENS = ("flickr2k", "coco")
+MIN_BATCHES_PER_EPOCH = 21
+MIN_CHECKPOINT_MB = 20.0
+IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".webp"}
+
+
 class MicroContrastDataset(Dataset):
+    def __init__(self, root_dir: str, image_size: int = 256, min_samples: int = 101):
+        super().__init__()
+        self.root = Path(root_dir)
+        self.image_size = image_size
+
+        if not self.root.exists() or not self.root.is_dir():
+            raise FileNotFoundError(f"Micro-contrast dataset directory not found: {self.root}")
+
+        self.images: List[Path] = [
+            p for p in self.root.rglob("*") if p.is_file() and p.suffix.lower() in IMAGE_EXTENSIONS
+        ]
+        self.images = sorted(self.images)
+
+        if len(self.images) == 0:
+            raise RuntimeError(f"Micro-contrast dataset is empty: {self.root}")
+        if len(self.images) <= 100:
+            raise RuntimeError(
+                f"Micro-contrast dataset too small ({len(self.images)} samples). Something is wrong with dataset loading."
+            )
+        if len(self.images) < min_samples:
+            raise RuntimeError(
+                f"Micro-contrast dataset has {len(self.images)} samples, expected at least {min_samples}."
+            )
+
     def __len__(self):
-        return 100
+        return len(self.images)
 
     def __getitem__(self, idx):
-        return torch.rand(3, 256, 256), torch.rand(3, 256, 256)
+        img = Image.open(self.images[idx]).convert("RGB")
+        img = img.resize((self.image_size, self.image_size), Image.Resampling.BILINEAR)
+        img_tensor = TF.to_tensor(img)
+        # Autoencoder-style identity target for enhancement model training.
+        return img_tensor, img_tensor
 
 
 def parse_args() -> argparse.Namespace:
@@ -25,8 +64,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--lr", type=float, default=5e-5)
+    parser.add_argument("--data-root", type=str, default="datasets/flickr2k")
     parser.add_argument("--checkpoint-dir", type=str, default="checkpoints")
-    parser.add_argument("--run-name", type=str, default="stage4_contrast")
+    parser.add_argument("--run-name", type=str, default=STAGE_NAME)
+    parser.add_argument("--num-workers", type=int, default=4)
+    parser.add_argument("--grad-log-interval", type=int, default=20)
     return parser.parse_args()
 
 
@@ -48,7 +90,35 @@ def load_checkpoint(path: Path, model: torch.nn.Module, optimizer: torch.optim.O
     else:
         model.load_state_dict(state_dict)
     optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-    return int(checkpoint["epoch"]), float(checkpoint.get("best_metric", float("inf")))
+    return int(checkpoint["epoch"]) + 1, float(checkpoint.get("best_metric", float("inf")))
+
+
+def validate_checkpoint_size(path: Path, min_mb: float = MIN_CHECKPOINT_MB) -> float:
+    checkpoint_size = path.stat().st_size / (1024 * 1024)
+    if checkpoint_size < min_mb:
+        raise RuntimeError(
+            f"Checkpoint too small ({checkpoint_size:.2f} MB) at {path}. Model not saved correctly."
+        )
+    return checkpoint_size
+
+
+def compute_grad_norm(model: torch.nn.Module) -> float:
+    total = 0.0
+    count = 0
+    for param in model.parameters():
+        if param.grad is not None:
+            total += float(param.grad.detach().abs().mean().item())
+            count += 1
+    return total if count > 0 else 0.0
+
+
+def run_sanity_check(loader: DataLoader, model: DDP, device: torch.device, rank: int) -> None:
+    sample_inputs, _ = next(iter(loader))
+    sample_inputs = sample_inputs.to(device, non_blocking=True)
+    with torch.no_grad():
+        output = model(sample_inputs)
+    if rank == 0:
+        print(f"Sanity check output shape: {tuple(output.shape)}")
 
 
 def main() -> None:
@@ -57,7 +127,13 @@ def main() -> None:
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required for this DDP training script (backend=nccl).")
 
-    dist.init_process_group(backend="nccl")
+    data_root = Path(args.data_root)
+    if not any(token in str(data_root).lower() for token in ALLOWED_DATASET_TOKENS):
+        raise RuntimeError(f"{STAGE_NAME} must use Flickr2K or COCO dataset path. Got: {data_root}")
+    if not data_root.exists() or not data_root.is_dir():
+        raise RuntimeError(f"Missing expected dataset directory for {STAGE_NAME}: {data_root}")
+
+    dist.init_process_group("nccl")
 
     local_rank = int(os.environ["LOCAL_RANK"])
     rank = int(os.environ["RANK"])
@@ -67,62 +143,125 @@ def main() -> None:
     device = torch.device(f"cuda:{local_rank}")
     torch.backends.cudnn.benchmark = True
 
-    dataset = MicroContrastDataset()
-    sampler = DistributedSampler(dataset, shuffle=True)
-    loader = DataLoader(dataset, batch_size=args.batch_size, sampler=sampler, num_workers=2, pin_memory=True)
+    try:
+        dataset = MicroContrastDataset(root_dir=str(data_root), min_samples=101)
+        sampler = DistributedSampler(dataset, shuffle=True)
 
-    model = DDP(MicroContrastModel(in_channels=3, out_channels=3).to(device), device_ids=[local_rank])
-    optimizer = optim.Adam(model.parameters(), lr=args.lr)
-    criterion = torch.nn.L1Loss().to(device)
+        num_workers = max(0, min(args.num_workers, (os.cpu_count() or 1) // max(world_size, 1)))
+        loader = DataLoader(
+            dataset,
+            batch_size=args.batch_size,
+            sampler=sampler,
+            num_workers=num_workers,
+            pin_memory=True,
+            persistent_workers=num_workers > 0,
+            drop_last=False,
+        )
 
-    ckpt_dir = Path(args.checkpoint_dir)
-    ckpt_dir.mkdir(parents=True, exist_ok=True)
-    latest_path = ckpt_dir / f"{args.run_name}_latest.pth"
-    best_path = ckpt_dir / f"{args.run_name}_best.pth"
-
-    start_epoch = 0
-    best_loss = float("inf")
-    if latest_path.exists():
-        if rank == 0:
-            print(f"Resuming from {latest_path}")
-        start_epoch, best_loss = load_checkpoint(latest_path, model, optimizer, device)
-    dist.barrier()
-
-    for epoch in range(start_epoch, args.epochs):
-        sampler.set_epoch(epoch)
-        model.train()
-        running_loss = 0.0
-
-        for inputs, targets in loader:
-            inputs = inputs.to(device, non_blocking=True)
-            targets = targets.to(device, non_blocking=True)
-
-            optimizer.zero_grad(set_to_none=True)
-            pred = model(inputs)
-            loss = criterion(pred, targets)
-            loss.backward()
-            optimizer.step()
-            running_loss += float(loss.item())
-
-        stats = torch.tensor([running_loss], device=device)
-        dist.all_reduce(stats, op=dist.ReduceOp.SUM)
-        avg_loss = (stats.item() / world_size) / max(len(loader), 1)
+        steps_per_epoch = len(loader)
+        if steps_per_epoch == 0:
+            raise RuntimeError("Dataloader produced 0 batches.")
+        if steps_per_epoch < MIN_BATCHES_PER_EPOCH:
+            raise RuntimeError(
+                f"{STAGE_NAME} expected at least {MIN_BATCHES_PER_EPOCH} batches/epoch, got {steps_per_epoch}."
+            )
 
         if rank == 0:
-            print(f"Epoch [{epoch + 1}/{args.epochs}] | Loss: {avg_loss:.6f}")
+            print(f"Dataset size: {len(dataset)}")
+            print(f"Batch size: {args.batch_size}")
+            print(f"Steps per epoch: {steps_per_epoch}")
+            print(f"GPUs: {world_size}")
+
+        model = MicroContrastModel(in_channels=3, out_channels=3).to(device)
+        model = DDP(model, device_ids=[local_rank])
+        optimizer = optim.Adam(model.parameters(), lr=args.lr)
+        criterion = torch.nn.L1Loss().to(device)
+
+        run_sanity_check(loader, model, device, rank)
+
+        ckpt_dir = Path(args.checkpoint_dir)
+        ckpt_dir.mkdir(parents=True, exist_ok=True)
+        latest_path = ckpt_dir / f"{args.run_name}_latest.pth"
+        best_path = ckpt_dir / f"{args.run_name}_best.pth"
+
+        start_epoch = 0
+        best_loss = float("inf")
+        if latest_path.exists():
+            if rank == 0:
+                print(f"Resuming from {latest_path}")
+            start_epoch, best_loss = load_checkpoint(latest_path, model, optimizer, device)
 
         dist.barrier()
-        if dist.get_rank() == 0:
-            current_epoch = epoch + 1
-            is_best = avg_loss < best_loss
-            if is_best:
-                best_loss = avg_loss
-            save_checkpoint(latest_path, current_epoch, model, optimizer, best_loss)
-            if is_best:
-                save_checkpoint(best_path, current_epoch, model, optimizer, best_loss)
-        dist.barrier()
 
-    dist.destroy_process_group()
+        if start_epoch >= args.epochs:
+            raise RuntimeError(
+                f"Resume epoch ({start_epoch}) >= target epochs ({args.epochs}). "
+                "Increase --epochs or remove checkpoint to continue training."
+            )
+
+        prev_epoch_loss = None
+        for epoch in range(start_epoch, args.epochs):
+            epoch_start = time.time()
+            sampler.set_epoch(epoch)
+            model.train()
+            running_loss = 0.0
+            zero_grad_counter = 0
+
+            for step, (inputs, targets) in enumerate(loader, start=1):
+                inputs = inputs.to(device, non_blocking=True)
+                targets = targets.to(device, non_blocking=True)
+
+                optimizer.zero_grad(set_to_none=True)
+                pred = model(inputs)
+                loss = criterion(pred, targets)
+                loss.backward()
+
+                grad_norm = compute_grad_norm(model)
+                if step % args.grad_log_interval == 0 and rank == 0:
+                    print(f"Grad norm: {grad_norm:.6e}")
+
+                if grad_norm <= 1e-12:
+                    zero_grad_counter += 1
+                    if zero_grad_counter >= 5:
+                        raise RuntimeError("Gradients are zero for 5 consecutive checks. Stopping training.")
+                else:
+                    zero_grad_counter = 0
+
+                optimizer.step()
+                running_loss += float(loss.item())
+
+            stats = torch.tensor([running_loss], device=device)
+            dist.all_reduce(stats, op=dist.ReduceOp.SUM)
+            avg_loss = (stats.item() / world_size) / max(steps_per_epoch, 1)
+            epoch_time = time.time() - epoch_start
+            improved_vs_prev = prev_epoch_loss is None or avg_loss < prev_epoch_loss
+
+            if rank == 0:
+                improved_text = "yes" if improved_vs_prev else "no"
+                print(
+                    f"Epoch [{epoch + 1}/{args.epochs}] | Loss: {avg_loss:.6f} "
+                    f"| Time: {epoch_time:.1f}s | Improved: {improved_text}"
+                )
+            prev_epoch_loss = avg_loss
+
+            dist.barrier()
+            if dist.get_rank() == 0:
+                current_epoch = epoch
+                is_best = avg_loss < best_loss
+                if is_best:
+                    best_loss = avg_loss
+
+                save_checkpoint(latest_path, current_epoch, model, optimizer, best_loss)
+                size_mb = validate_checkpoint_size(latest_path, MIN_CHECKPOINT_MB)
+                print(f"Checkpoint size: {size_mb:.2f} MB ({latest_path})")
+
+                if is_best:
+                    save_checkpoint(best_path, current_epoch, model, optimizer, best_loss)
+                    validate_checkpoint_size(best_path, MIN_CHECKPOINT_MB)
+            dist.barrier()
+    finally:
+        if dist.is_initialized():
+            dist.destroy_process_group()
 
 
 if __name__ == "__main__":

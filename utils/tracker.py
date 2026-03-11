@@ -36,6 +36,7 @@ class ModelTracker:
         is_best: bool = False,
         scheduler: Optional[torch.optim.lr_scheduler._LRScheduler] = None,
         extra_state: Optional[dict] = None,
+        min_checkpoint_mb: float = 0.0,
     ) -> None:
         """
         Save checkpoint using recommended state_dict pattern.
@@ -54,9 +55,21 @@ class ModelTracker:
             checkpoint.update(extra_state)
 
         torch.save(checkpoint, self.save_path)
+        if min_checkpoint_mb > 0:
+            size_mb = os.path.getsize(self.save_path) / (1024 * 1024)
+            if size_mb < min_checkpoint_mb:
+                raise RuntimeError(
+                    f"Checkpoint too small ({size_mb:.2f} MB) at {self.save_path}. Model not saved correctly."
+                )
 
         if is_best:
             shutil.copyfile(self.save_path, self.best_save_path)
+            if min_checkpoint_mb > 0:
+                size_mb = os.path.getsize(self.best_save_path) / (1024 * 1024)
+                if size_mb < min_checkpoint_mb:
+                    raise RuntimeError(
+                        f"Checkpoint too small ({size_mb:.2f} MB) at {self.best_save_path}. Model not saved correctly."
+                    )
             print(f" -> Checkpoint [Epoch {epoch}] new best metric: {best_metric:.6f}")
 
     def attempt_resume(

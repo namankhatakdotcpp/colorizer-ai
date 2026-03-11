@@ -6,6 +6,10 @@ import numpy as np
 import torch
 from PIL import Image
 from skimage.color import lab2rgb
+try:
+    import cv2
+except Exception:
+    cv2 = None
 
 from models.unet_colorizer import UNetColorizer
 from models.rrdb_sr import RRDBNet
@@ -52,6 +56,30 @@ def stage1_colorize(gray_img: Image.Image, model: UNetColorizer, device: torch.d
     return rgb
 
 
+def apply_lab_temperature_correction(rgb: np.ndarray, delta_a: int = 5, delta_b: int = 5) -> np.ndarray:
+    if cv2 is None:
+        print("[WARN] OpenCV unavailable; skipping LAB temperature correction.")
+        return rgb
+    if rgb.ndim != 3 or rgb.shape[2] != 3:
+        print(f"[WARN] Unexpected image shape {rgb.shape}; skipping LAB temperature correction.")
+        return rgb
+
+    try:
+        rgb_u8 = np.clip(rgb * 255.0, 0.0, 255.0).astype(np.uint8)
+        bgr = cv2.cvtColor(rgb_u8, cv2.COLOR_RGB2BGR)
+        lab = cv2.cvtColor(bgr, cv2.COLOR_BGR2LAB).astype(np.int16)
+
+        lab[:, :, 1] = np.clip(lab[:, :, 1] + int(delta_a), 0, 255)
+        lab[:, :, 2] = np.clip(lab[:, :, 2] + int(delta_b), 0, 255)
+
+        corrected_bgr = cv2.cvtColor(lab.astype(np.uint8), cv2.COLOR_LAB2BGR)
+        corrected_rgb = cv2.cvtColor(corrected_bgr, cv2.COLOR_BGR2RGB)
+        return corrected_rgb.astype(np.float32) / 255.0
+    except Exception as exc:
+        print(f"[WARN] LAB temperature correction failed, skipping: {exc}")
+        return rgb
+
+
 def maybe_run_full_pipeline(rgb: np.ndarray, device: torch.device, checkpoints: Path) -> np.ndarray:
     rgb_tensor = torch.from_numpy(rgb).permute(2, 0, 1).unsqueeze(0).float().to(device)
 
@@ -74,7 +102,15 @@ def maybe_run_full_pipeline(rgb: np.ndarray, device: torch.device, checkpoints: 
     return out
 
 
-def run(input_image: Path, output_dir: Path, checkpoints: Path, run_full_pipeline: bool) -> Path:
+def run(
+    input_image: Path,
+    output_dir: Path,
+    checkpoints: Path,
+    run_full_pipeline: bool,
+    apply_temperature_correction: bool = False,
+    temperature_delta_a: int = 5,
+    temperature_delta_b: int = 5,
+) -> Path:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -89,6 +125,12 @@ def run(input_image: Path, output_dir: Path, checkpoints: Path, run_full_pipelin
 
     gray = Image.open(input_image).convert("L")
     rgb = stage1_colorize(gray, colorizer, device)
+    if apply_temperature_correction:
+        rgb = apply_lab_temperature_correction(
+            rgb,
+            delta_a=temperature_delta_a,
+            delta_b=temperature_delta_b,
+        )
 
     if run_full_pipeline:
         rgb = maybe_run_full_pipeline(rgb, device, checkpoints)
@@ -106,12 +148,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", type=Path, default=Path("outputs"))
     parser.add_argument("--checkpoints", type=Path, default=Path("checkpoints"))
     parser.add_argument("--full-pipeline", action="store_true", help="Run SR/depth/contrast stages if checkpoints are present")
+    parser.add_argument("--lab-temp-correction", action="store_true", help="Enable LAB temperature correction after Stage1.")
+    parser.add_argument("--lab-temp-a", type=int, default=5, help="LAB channel A additive correction.")
+    parser.add_argument("--lab-temp-b", type=int, default=5, help="LAB channel B additive correction.")
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
-    run(args.image, args.output_dir, args.checkpoints, args.full_pipeline)
+    run(
+        args.image,
+        args.output_dir,
+        args.checkpoints,
+        args.full_pipeline,
+        apply_temperature_correction=args.lab_temp_correction,
+        temperature_delta_a=args.lab_temp_a,
+        temperature_delta_b=args.lab_temp_b,
+    )
 
 
 if __name__ == "__main__":
