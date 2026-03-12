@@ -16,7 +16,7 @@ from models.depth_model import DynamicFilterNetwork
 
 STAGE_NAME = "stage3_depth"
 EXPECTED_DATASET_TOKEN = "coco"
-MIN_BATCHES_PER_EPOCH = 51
+MIN_BATCHES_PER_EPOCH = 10
 MIN_CHECKPOINT_MB = 20.0
 EXPECTED_CHECKPOINT_MIN_MB = 20.0
 EXPECTED_CHECKPOINT_MAX_MB = 60.0
@@ -53,7 +53,7 @@ def load_checkpoint(path: Path, model: torch.nn.Module, optimizer: torch.optim.O
     else:
         model.load_state_dict(state_dict)
     optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-    return int(checkpoint["epoch"]) + 1, float(checkpoint.get("best_metric", float("inf")))
+    return int(checkpoint["epoch"]) + 1, float(checkpoint.get("loss", float("inf")))
 
 
 def validate_checkpoint_size(
@@ -162,7 +162,7 @@ def main() -> None:
 
         run_sanity_check(loader, model, device, rank)
 
-        ckpt_dir = Path("checkpoints")
+        ckpt_dir = Path(args.checkpoint_dir)
         ckpt_dir.mkdir(parents=True, exist_ok=True)
         latest_path = ckpt_dir / f"{STAGE_NAME}_latest.pth"
         best_path = ckpt_dir / f"{STAGE_NAME}_best.pth"

@@ -76,7 +76,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--grad-log-interval", type=int, default=20)
     parser.add_argument("--image-size", type=int, default=256)
     parser.add_argument("--perceptual-weight", type=float, default=0.1)
-    parser.add_argument("--chroma-var-weight", type=float, default=0.01)
+    parser.add_argument("--colorfulness-weight", type=float, default=0.05)
     parser.add_argument("--disable-perceptual-loss", action="store_true")
     return parser.parse_args()
 
@@ -198,9 +198,39 @@ def main() -> None:
 
         if rank == 0:
             print("Stage1 datasets:")
-            for root, count in dataset_stats.items():
-                print(f"  - {root}: {count}")
+            combined_color_var = 0.0
+            combined_images = 0
+            combined_w = 0.0
+            combined_h = 0.0
+            for root, info in dataset_stats.items():
+                size = int(info.get("size", 0))
+                color_var = float(info.get("color_variance", 0.0))
+                avg_res = info.get("average_resolution", (0.0, 0.0))
+                avg_w = float(avg_res[0]) if isinstance(avg_res, (list, tuple)) and len(avg_res) >= 2 else 0.0
+                avg_h = float(avg_res[1]) if isinstance(avg_res, (list, tuple)) and len(avg_res) >= 2 else 0.0
+                res_dist = info.get("resolution_distribution", {})
+                rejected_corrupt = int(info.get("rejected_corrupt", 0))
+                rejected_grayscale = int(info.get("rejected_grayscale", 0))
+
+                combined_color_var += color_var * size
+                combined_images += size
+                combined_w += avg_w * size
+                combined_h += avg_h * size
+
+                print(f"  - {root}: {size} images")
+                print(
+                    f"    color_variance={color_var:.6f}, "
+                    f"avg_resolution=({avg_w:.1f}, {avg_h:.1f}), "
+                    f"rejected_corrupt={rejected_corrupt}, rejected_grayscale={rejected_grayscale}"
+                )
+                print(f"    resolution_distribution={res_dist}")
             print(f"Dataset size: {len(dataset)}")
+            if combined_images > 0:
+                print(f"Color variance: {combined_color_var / combined_images:.6f}")
+                print(
+                    "Average resolution: "
+                    f"({combined_w / combined_images:.1f}, {combined_h / combined_images:.1f})"
+                )
             print(f"Batch size: {args.batch_size}")
             print(f"Steps per epoch: {steps_per_epoch}")
             print(f"GPUs: {world_size}")
@@ -255,7 +285,7 @@ def main() -> None:
             running_loss = 0.0
             running_l1_loss = 0.0
             running_perceptual_loss = 0.0
-            running_color_var = 0.0
+            running_colorfulness = 0.0
             zero_grad_counter = 0
 
             for step, (l_channel, ab_target) in enumerate(loader, start=1):
@@ -266,8 +296,8 @@ def main() -> None:
                 ab_pred = model(l_channel)
                 l1_loss = criterion(ab_pred, ab_target)
                 p_loss = perceptual_loss_fn(ab_pred, ab_target, l_channel)
-                color_var = torch.var(ab_pred)
-                loss = l1_loss + args.perceptual_weight * p_loss + args.chroma_var_weight * color_var
+                colorfulness = torch.mean(torch.sqrt(ab_pred[:, 0] ** 2 + ab_pred[:, 1] ** 2 + 1e-8))
+                loss = l1_loss + args.perceptual_weight * p_loss + args.colorfulness_weight * colorfulness
                 if torch.isnan(loss):
                     raise RuntimeError("NaN loss detected")
                 loss.backward()
@@ -288,21 +318,21 @@ def main() -> None:
                 running_loss += float(loss.item())
                 running_l1_loss += float(l1_loss.item())
                 running_perceptual_loss += float(p_loss.item())
-                running_color_var += float(color_var.item())
+                running_colorfulness += float(colorfulness.item())
 
-            stats = torch.tensor([running_loss, running_l1_loss, running_perceptual_loss, running_color_var], device=device)
+            stats = torch.tensor([running_loss, running_l1_loss, running_perceptual_loss, running_colorfulness], device=device)
             dist.all_reduce(stats, op=dist.ReduceOp.SUM)
             denom = world_size * max(steps_per_epoch, 1)
             avg_loss = float(stats[0].item()) / denom
             avg_l1_loss = float(stats[1].item()) / denom
             avg_perceptual_loss = float(stats[2].item()) / denom
-            avg_color_var = float(stats[3].item()) / denom
+            avg_colorfulness = float(stats[3].item()) / denom
             epoch_time = time.time() - epoch_start
 
             if rank == 0:
                 print(
                     f"Epoch [{epoch + 1}/{args.epochs}] | Loss: {avg_loss:.6f} "
-                    f"(L1: {avg_l1_loss:.6f}, P: {avg_perceptual_loss:.6f}, Var: {avg_color_var:.6f}) "
+                    f"(L1: {avg_l1_loss:.6f}, P: {avg_perceptual_loss:.6f}, C: {avg_colorfulness:.6f}) "
                     f"| Steps: {steps_per_epoch} | Time: {epoch_time:.1f}s"
                 )
 

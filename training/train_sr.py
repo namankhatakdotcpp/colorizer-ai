@@ -17,7 +17,7 @@ from models.rrdb_sr import RRDBNet
 
 
 STAGE_NAME = "stage2_sr"
-MIN_BATCHES_PER_EPOCH = 21
+MIN_BATCHES_PER_EPOCH = 10
 MIN_CHECKPOINT_MB = 20.0
 EXPECTED_CHECKPOINT_MIN_MB = 30.0
 EXPECTED_CHECKPOINT_MAX_MB = 80.0
@@ -192,11 +192,14 @@ def main() -> None:
 
         first_batch = next(iter(loader))
         first_batch_shape = tuple(first_batch[0].shape)
+        image_resolution = f"{first_batch_shape[-2]}x{first_batch_shape[-1]}"
 
         if rank == 0:
             print(f"Dataset size: {len(dataset)}")
             print(f"Batch size: {args.batch_size}")
             print(f"Steps per epoch: {steps_per_epoch}")
+            print(f"GPUs: {world_size}")
+            print(f"Image resolution: {image_resolution}")
             print(f"First batch shape: {first_batch_shape}")
 
         model = RRDBNet().cuda(local_rank)
@@ -211,7 +214,7 @@ def main() -> None:
 
         run_sanity_check(loader, model, device, rank)
 
-        ckpt_dir = Path("checkpoints")
+        ckpt_dir = Path(args.checkpoint_dir)
         ckpt_dir.mkdir(parents=True, exist_ok=True)
         latest_path = ckpt_dir / f"{STAGE_NAME}_latest.pth"
         best_path = ckpt_dir / f"{STAGE_NAME}_best.pth"

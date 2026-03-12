@@ -15,7 +15,7 @@ class Settings(BaseSettings):
     ALLOWED_MIME_TYPES: list[str] = ["image/jpeg", "image/png", "image/webp"]
     
     # Model Settings
-    MODEL_WEIGHTS_PATH: str = "checkpoints/stage1_colorizer_latest.pth"
+    MODEL_WEIGHTS_PATH: str = "checkpoints/stage1_colorizer_best.pth"
     USE_HALF_PRECISION: bool = False
     
     # Admin Settings

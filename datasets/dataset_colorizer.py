@@ -1,6 +1,7 @@
 import random
+from collections import Counter
 from pathlib import Path
-from typing import Dict, List, Sequence, Tuple
+from typing import Any, Dict, List, Sequence, Tuple
 
 import numpy as np
 from PIL import Image
@@ -11,6 +12,17 @@ from torch.utils.data import ConcatDataset, Dataset
 import torchvision.transforms as T
 
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".webp"}
+
+
+def _resolution_bucket(width: int, height: int) -> str:
+    short_side = min(width, height)
+    if short_side <= 256:
+        return "0-256"
+    if short_side <= 512:
+        return "257-512"
+    if short_side <= 1024:
+        return "513-1024"
+    return "1025+"
 
 
 class ColorizationDataset(Dataset):
@@ -32,6 +44,7 @@ class ColorizationDataset(Dataset):
         self.ab_dir = self.root_dir / "AB"
         self.augment = augment
         self.image_size = image_size
+        self.stats: Dict[str, Any] = {}
 
         if not self.l_dir.is_dir() or not self.ab_dir.is_dir():
             raise FileNotFoundError(
@@ -67,6 +80,41 @@ class ColorizationDataset(Dataset):
             raise RuntimeError(
                 f"Colorization dataset has {len(self.samples)} samples, expected at least {min_samples}."
             )
+
+        # Lightweight dataset quality statistics for startup diagnostics.
+        color_vars: List[float] = []
+        res_counter: Counter[str] = Counter()
+        sum_w = 0.0
+        sum_h = 0.0
+        counted = 0
+        sample_count = min(256, len(self.samples))
+        for l_path, ab_path in self.samples[:sample_count]:
+            try:
+                l_arr = np.load(l_path)
+                ab_arr = np.load(ab_path)
+            except Exception:
+                continue
+
+            if l_arr.ndim == 2:
+                h, w = l_arr.shape
+                res_counter[_resolution_bucket(w, h)] += 1
+                sum_w += float(w)
+                sum_h += float(h)
+                counted += 1
+            if ab_arr.ndim == 3 and ab_arr.shape[2] == 2:
+                color_vars.append(float(np.var(ab_arr)))
+
+        self.stats = {
+            "size": len(self.samples),
+            "color_variance": float(np.mean(color_vars)) if color_vars else 0.0,
+            "average_resolution": (
+                float(sum_w / counted) if counted > 0 else 0.0,
+                float(sum_h / counted) if counted > 0 else 0.0,
+            ),
+            "resolution_distribution": dict(res_counter),
+            "rejected_corrupt": 0,
+            "rejected_grayscale": 0,
+        }
 
     def __len__(self) -> int:
         return len(self.samples)
@@ -132,6 +180,7 @@ class ImageColorizationDataset(Dataset):
         self.root_dir = Path(root_dir)
         self.image_size = image_size
         self.augment = augment
+        self.stats: Dict[str, Any] = {}
         self.aug_transform = T.Compose(
             [
                 T.RandomHorizontalFlip(p=0.5),
@@ -147,9 +196,52 @@ class ImageColorizationDataset(Dataset):
         if not self.root_dir.exists() or not self.root_dir.is_dir():
             raise FileNotFoundError(f"Colorization image dataset not found: {self.root_dir}")
 
-        self.images: List[Path] = sorted(
+        image_candidates: List[Path] = sorted(
             p for p in self.root_dir.rglob("*") if p.is_file() and p.suffix.lower() in IMAGE_EXTENSIONS
         )
+
+        valid_images: List[Path] = []
+        color_vars: List[float] = []
+        res_counter: Counter[str] = Counter()
+        sum_w = 0.0
+        sum_h = 0.0
+        counted = 0
+        rejected_corrupt = 0
+        rejected_grayscale = 0
+        max_stats_samples = 512
+
+        for path in image_candidates:
+            try:
+                # Fast corruption check.
+                with Image.open(path) as probe:
+                    probe.verify()
+
+                with Image.open(path) as img:
+                    rgb = img.convert("RGB")
+                    w, h = rgb.size
+                    res_counter[_resolution_bucket(w, h)] += 1
+                    sum_w += float(w)
+                    sum_h += float(h)
+                    counted += 1
+
+                    # Reject near-grayscale images using per-channel differences.
+                    thumb = rgb.resize((64, 64), Image.Resampling.BILINEAR)
+                    arr = np.asarray(thumb, dtype=np.float32) / 255.0
+                    rg_diff = np.mean(np.abs(arr[:, :, 0] - arr[:, :, 1]))
+                    gb_diff = np.mean(np.abs(arr[:, :, 1] - arr[:, :, 2]))
+                    if rg_diff < 0.01 and gb_diff < 0.01:
+                        rejected_grayscale += 1
+                        continue
+
+                    if len(color_vars) < max_stats_samples:
+                        color_vars.append(float(np.var(arr[:, :, 1:3])))
+
+                valid_images.append(path)
+            except Exception:
+                rejected_corrupt += 1
+                continue
+
+        self.images = valid_images
 
         if len(self.images) == 0:
             raise RuntimeError(f"Colorization image dataset is empty: {self.root_dir}")
@@ -157,6 +249,18 @@ class ImageColorizationDataset(Dataset):
             raise RuntimeError(
                 f"Colorization image dataset has {len(self.images)} samples, expected at least {min_samples}."
             )
+
+        self.stats = {
+            "size": len(self.images),
+            "color_variance": float(np.mean(color_vars)) if color_vars else 0.0,
+            "average_resolution": (
+                float(sum_w / counted) if counted > 0 else 0.0,
+                float(sum_h / counted) if counted > 0 else 0.0,
+            ),
+            "resolution_distribution": dict(res_counter),
+            "rejected_corrupt": rejected_corrupt,
+            "rejected_grayscale": rejected_grayscale,
+        }
 
     def __len__(self) -> int:
         return len(self.images)
@@ -188,7 +292,7 @@ def build_combined_colorization_dataset(
     augment: bool = True,
     image_size: int = 256,
     warn_min_total_samples: int = 50000,
-) -> Tuple[ConcatDataset, Dict[str, int]]:
+) -> Tuple[ConcatDataset, Dict[str, Dict[str, Any]]]:
     """
     Build a Stage1 dataset from multiple roots.
     Uses preprocessed LAB pairs when <root>/L and <root>/AB exist, otherwise RGB image fallback.
@@ -198,7 +302,7 @@ def build_combined_colorization_dataset(
         raise RuntimeError("No dataset roots provided for Stage1 training.")
 
     datasets: List[Dataset] = []
-    stats: Dict[str, int] = {}
+    stats: Dict[str, Dict[str, Any]] = {}
 
     for root in data_roots:
         root_path = Path(root)
@@ -221,7 +325,17 @@ def build_combined_colorization_dataset(
             )
 
         datasets.append(ds)
-        stats[str(root_path)] = len(ds)
+        ds_stats = getattr(ds, "stats", None)
+        if not ds_stats:
+            ds_stats = {
+                "size": len(ds),
+                "color_variance": 0.0,
+                "average_resolution": (0.0, 0.0),
+                "resolution_distribution": {},
+                "rejected_corrupt": 0,
+                "rejected_grayscale": 0,
+            }
+        stats[str(root_path)] = ds_stats
 
     combined = ConcatDataset(datasets)
     total = len(combined)
