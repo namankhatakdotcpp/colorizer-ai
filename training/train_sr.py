@@ -2,24 +2,64 @@ import argparse
 import os
 import time
 from pathlib import Path
+from typing import List
 
+from PIL import Image
 import torch
 import torch.distributed as dist
 import torch.optim as optim
 from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.utils.data import DataLoader
+from torch.utils.data import ConcatDataset, DataLoader, Dataset
 from torch.utils.data.distributed import DistributedSampler
+import torchvision.transforms.functional as TF
 
-from datasets.dataset_sr import SRDataset
 from models.rrdb_sr import RRDBNet
 
 
 STAGE_NAME = "stage2_sr"
-EXPECTED_DATASET_TOKEN = "div2k"
 MIN_BATCHES_PER_EPOCH = 21
 MIN_CHECKPOINT_MB = 20.0
 EXPECTED_CHECKPOINT_MIN_MB = 30.0
 EXPECTED_CHECKPOINT_MAX_MB = 80.0
+
+
+class SRImageFolderDataset(Dataset):
+    def __init__(self, root_dir: str, crop_size: int = 256, scale_factor: int = 4):
+        self.root_dir = Path(root_dir)
+        self.crop_size = crop_size
+        self.scale_factor = scale_factor
+        self.lr_size = crop_size // scale_factor
+
+        if not self.root_dir.exists() or not self.root_dir.is_dir():
+            raise FileNotFoundError(f"SR dataset directory not found: {self.root_dir}")
+
+        # Requirement: recursive loader with glob("**/*.jpg") and glob("**/*.png").
+        image_paths = list(self.root_dir.glob("**/*.jpg")) + list(self.root_dir.glob("**/*.png"))
+        # Practical extension: support uppercase variants too.
+        image_paths += list(self.root_dir.glob("**/*.JPG")) + list(self.root_dir.glob("**/*.PNG"))
+        self.images: List[Path] = sorted(set(image_paths))
+
+        if len(self.images) == 0:
+            raise RuntimeError(f"SR dataset is empty: {self.root_dir}")
+
+    def __len__(self) -> int:
+        return len(self.images)
+
+    def __getitem__(self, idx: int):
+        hr_img = Image.open(self.images[idx]).convert("RGB")
+        w, h = hr_img.size
+
+        # Safe random crop.
+        if w < self.crop_size or h < self.crop_size:
+            hr_img = hr_img.resize((max(w, self.crop_size), max(h, self.crop_size)), Image.Resampling.BICUBIC)
+            w, h = hr_img.size
+
+        left = torch.randint(0, w - self.crop_size + 1, (1,)).item()
+        top = torch.randint(0, h - self.crop_size + 1, (1,)).item()
+        hr_crop = hr_img.crop((left, top, left + self.crop_size, top + self.crop_size))
+        lr_img = hr_crop.resize((self.lr_size, self.lr_size), Image.Resampling.BICUBIC)
+
+        return TF.to_tensor(lr_img), TF.to_tensor(hr_crop)
 
 
 def parse_args() -> argparse.Namespace:
@@ -27,10 +67,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--lr", type=float, default=2e-4)
-    parser.add_argument("--data-root", type=str, default="datasets/div2k")
+    parser.add_argument("--flickr-root", type=str, default="datasets/flickr2k")
+    parser.add_argument("--div2k-root", type=str, default="datasets/div2k")
+    parser.add_argument("--coco-root", type=str, default="datasets/coco/train2017")
     parser.add_argument("--checkpoint-dir", type=str, default="checkpoints")
     parser.add_argument("--run-name", type=str, default=STAGE_NAME)
-    parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--grad-log-interval", type=int, default=20)
     return parser.parse_args()
 
@@ -53,7 +94,7 @@ def load_checkpoint(path: Path, model: torch.nn.Module, optimizer: torch.optim.O
     else:
         model.load_state_dict(state_dict)
     optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-    return int(checkpoint["epoch"]) + 1, float(checkpoint.get("best_metric", float("inf")))
+    return int(checkpoint["epoch"]) + 1, float(checkpoint.get("loss", float("inf")))
 
 
 def validate_checkpoint_size(
@@ -99,12 +140,6 @@ def main() -> None:
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required for this DDP training script (backend=nccl).")
 
-    data_root = Path(args.data_root)
-    if EXPECTED_DATASET_TOKEN not in str(data_root).lower():
-        raise RuntimeError(f"{STAGE_NAME} must use DIV2K dataset path. Got: {data_root}")
-    if not data_root.exists() or not data_root.is_dir():
-        raise RuntimeError(f"Missing expected dataset directory for {STAGE_NAME}: {data_root}")
-
     local_rank = int(os.environ["LOCAL_RANK"])
     dist.init_process_group(backend="nccl")
     rank = int(os.environ["RANK"])
@@ -115,20 +150,37 @@ def main() -> None:
     torch.backends.cudnn.benchmark = True
 
     try:
-        dataset = SRDataset(root_dir=str(data_root), min_samples=101)
-        if len(dataset) == 0:
+        flickr_dataset = SRImageFolderDataset(args.flickr_root)
+        div2k_dataset = SRImageFolderDataset(args.div2k_root)
+        coco_dataset = SRImageFolderDataset(args.coco_root)
+
+        dataset = ConcatDataset([flickr_dataset, div2k_dataset, coco_dataset])
+        total_images = len(dataset)
+
+        if rank == 0:
+            print("--------------------------------")
+            print("SR Training Dataset Summary")
+            print(f"Flickr2K: {len(flickr_dataset)}")
+            print(f"DIV2K: {len(div2k_dataset)}")
+            print(f"COCO: {len(coco_dataset)}")
+            print(f"TOTAL: {total_images}")
+            print("--------------------------------")
+
+        if total_images == 0:
             raise RuntimeError("Dataset is empty")
+        if total_images < 10000:
+            raise RuntimeError("Dataset too small — loader failure")
 
+        # In DDP, shuffling is handled by DistributedSampler(shuffle=True).
         sampler = DistributedSampler(dataset, shuffle=True)
-
-        num_workers = max(0, min(args.num_workers, (os.cpu_count() or 1) // max(world_size, 1)))
+        num_workers = 8
         loader = DataLoader(
             dataset,
             batch_size=args.batch_size,
             sampler=sampler,
             num_workers=num_workers,
             pin_memory=True,
-            persistent_workers=num_workers > 0,
+            persistent_workers=True,
             drop_last=False,
         )
 
@@ -140,14 +192,11 @@ def main() -> None:
 
         first_batch = next(iter(loader))
         first_batch_shape = tuple(first_batch[0].shape)
-        image_resolution = f"{first_batch_shape[-2]}x{first_batch_shape[-1]}"
 
         if rank == 0:
             print(f"Dataset size: {len(dataset)}")
             print(f"Batch size: {args.batch_size}")
             print(f"Steps per epoch: {steps_per_epoch}")
-            print(f"GPUs: {world_size}")
-            print(f"Image resolution: {image_resolution}")
             print(f"First batch shape: {first_batch_shape}")
 
         model = RRDBNet().cuda(local_rank)
