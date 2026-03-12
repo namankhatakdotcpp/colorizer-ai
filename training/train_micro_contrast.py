@@ -20,6 +20,8 @@ STAGE_NAME = "stage4_contrast"
 ALLOWED_DATASET_TOKENS = ("flickr2k", "coco")
 MIN_BATCHES_PER_EPOCH = 21
 MIN_CHECKPOINT_MB = 20.0
+EXPECTED_CHECKPOINT_MIN_MB = 20.0
+EXPECTED_CHECKPOINT_MAX_MB = 50.0
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".webp"}
 
 
@@ -72,12 +74,12 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def save_checkpoint(path: Path, epoch: int, model: torch.nn.Module, optimizer: torch.optim.Optimizer, best_metric: float) -> None:
+def save_checkpoint(path: Path, epoch: int, model: DDP, optimizer: torch.optim.Optimizer, loss_value: float) -> None:
     checkpoint = {
         "epoch": epoch,
-        "model_state_dict": model.module.state_dict() if hasattr(model, "module") else model.state_dict(),
+        "model_state_dict": model.module.state_dict(),
         "optimizer_state_dict": optimizer.state_dict(),
-        "best_metric": best_metric,
+        "loss": float(loss_value),
     }
     torch.save(checkpoint, path)
 
@@ -93,11 +95,20 @@ def load_checkpoint(path: Path, model: torch.nn.Module, optimizer: torch.optim.O
     return int(checkpoint["epoch"]) + 1, float(checkpoint.get("best_metric", float("inf")))
 
 
-def validate_checkpoint_size(path: Path, min_mb: float = MIN_CHECKPOINT_MB) -> float:
-    checkpoint_size = path.stat().st_size / (1024 * 1024)
+def validate_checkpoint_size(
+    path: Path,
+    min_mb: float = MIN_CHECKPOINT_MB,
+    expected_min_mb: float = EXPECTED_CHECKPOINT_MIN_MB,
+    expected_max_mb: float = EXPECTED_CHECKPOINT_MAX_MB,
+) -> float:
+    checkpoint_size = os.path.getsize(path) / (1024 * 1024)
+    print(f"Checkpoint saved: {checkpoint_size:.2f} MB")
     if checkpoint_size < min_mb:
-        raise RuntimeError(
-            f"Checkpoint too small ({checkpoint_size:.2f} MB) at {path}. Model not saved correctly."
+        raise RuntimeError("Checkpoint too small — model weights not saved correctly")
+    if checkpoint_size < expected_min_mb or checkpoint_size > expected_max_mb:
+        print(
+            f"[WARN] {STAGE_NAME} checkpoint size {checkpoint_size:.2f} MB is outside "
+            f"expected range {expected_min_mb:.0f}-{expected_max_mb:.0f} MB."
         )
     return checkpoint_size
 
@@ -133,9 +144,8 @@ def main() -> None:
     if not data_root.exists() or not data_root.is_dir():
         raise RuntimeError(f"Missing expected dataset directory for {STAGE_NAME}: {data_root}")
 
-    dist.init_process_group("nccl")
-
     local_rank = int(os.environ["LOCAL_RANK"])
+    dist.init_process_group(backend="nccl")
     rank = int(os.environ["RANK"])
     world_size = int(os.environ["WORLD_SIZE"])
 
@@ -145,6 +155,9 @@ def main() -> None:
 
     try:
         dataset = MicroContrastDataset(root_dir=str(data_root), min_samples=101)
+        if len(dataset) == 0:
+            raise RuntimeError("Dataset is empty")
+
         sampler = DistributedSampler(dataset, shuffle=True)
 
         num_workers = max(0, min(args.num_workers, (os.cpu_count() or 1) // max(world_size, 1)))
@@ -160,29 +173,38 @@ def main() -> None:
 
         steps_per_epoch = len(loader)
         if steps_per_epoch == 0:
-            raise RuntimeError("Dataloader produced 0 batches.")
+            raise RuntimeError("No batches produced")
         if steps_per_epoch < MIN_BATCHES_PER_EPOCH:
-            raise RuntimeError(
-                f"{STAGE_NAME} expected at least {MIN_BATCHES_PER_EPOCH} batches/epoch, got {steps_per_epoch}."
-            )
+            raise RuntimeError("Dataset too small")
+
+        first_batch = next(iter(loader))
+        first_batch_shape = tuple(first_batch[0].shape)
+        image_resolution = f"{first_batch_shape[-2]}x{first_batch_shape[-1]}"
 
         if rank == 0:
             print(f"Dataset size: {len(dataset)}")
             print(f"Batch size: {args.batch_size}")
             print(f"Steps per epoch: {steps_per_epoch}")
             print(f"GPUs: {world_size}")
+            print(f"Image resolution: {image_resolution}")
+            print(f"First batch shape: {first_batch_shape}")
 
-        model = MicroContrastModel(in_channels=3, out_channels=3).to(device)
+        model = MicroContrastModel(in_channels=3, out_channels=3).cuda(local_rank)
+        total_params = sum(p.numel() for p in model.parameters())
+        if total_params < 1_000_000:
+            raise RuntimeError("Model architecture incorrect")
+        if rank == 0:
+            print(f"Model parameters: {total_params:,}")
         model = DDP(model, device_ids=[local_rank])
         optimizer = optim.Adam(model.parameters(), lr=args.lr)
         criterion = torch.nn.L1Loss().to(device)
 
         run_sanity_check(loader, model, device, rank)
 
-        ckpt_dir = Path(args.checkpoint_dir)
+        ckpt_dir = Path("checkpoints")
         ckpt_dir.mkdir(parents=True, exist_ok=True)
-        latest_path = ckpt_dir / f"{args.run_name}_latest.pth"
-        best_path = ckpt_dir / f"{args.run_name}_best.pth"
+        latest_path = ckpt_dir / f"{STAGE_NAME}_latest.pth"
+        best_path = ckpt_dir / f"{STAGE_NAME}_best.pth"
 
         start_epoch = 0
         best_loss = float("inf")
@@ -214,7 +236,10 @@ def main() -> None:
                 optimizer.zero_grad(set_to_none=True)
                 pred = model(inputs)
                 loss = criterion(pred, targets)
+                if torch.isnan(loss):
+                    raise RuntimeError("NaN loss detected")
                 loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
 
                 grad_norm = compute_grad_norm(model)
                 if step % args.grad_log_interval == 0 and rank == 0:
@@ -240,7 +265,7 @@ def main() -> None:
                 improved_text = "yes" if improved_vs_prev else "no"
                 print(
                     f"Epoch [{epoch + 1}/{args.epochs}] | Loss: {avg_loss:.6f} "
-                    f"| Time: {epoch_time:.1f}s | Improved: {improved_text}"
+                    f"| Steps: {steps_per_epoch} | Time: {epoch_time:.1f}s | Improved: {improved_text}"
                 )
             prev_epoch_loss = avg_loss
 
@@ -251,12 +276,11 @@ def main() -> None:
                 if is_best:
                     best_loss = avg_loss
 
-                save_checkpoint(latest_path, current_epoch, model, optimizer, best_loss)
-                size_mb = validate_checkpoint_size(latest_path, MIN_CHECKPOINT_MB)
-                print(f"Checkpoint size: {size_mb:.2f} MB ({latest_path})")
+                save_checkpoint(latest_path, current_epoch, model, optimizer, avg_loss)
+                validate_checkpoint_size(latest_path, MIN_CHECKPOINT_MB)
 
                 if is_best:
-                    save_checkpoint(best_path, current_epoch, model, optimizer, best_loss)
+                    save_checkpoint(best_path, current_epoch, model, optimizer, avg_loss)
                     validate_checkpoint_size(best_path, MIN_CHECKPOINT_MB)
             dist.barrier()
     finally:
