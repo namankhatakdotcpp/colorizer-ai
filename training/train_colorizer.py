@@ -1,13 +1,27 @@
 import argparse
+import contextlib
+import hashlib
 import os
+import shutil
+import socket
+# Cap CPU thread fan-out to reduce contention on shared nodes.
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
+# Keep NCCL logs actionable and fail fast on async communicator errors.
+os.environ["NCCL_DEBUG"] = "WARN"
+os.environ["NCCL_ASYNC_ERROR_HANDLING"] = "1"
+os.environ["NCCL_BLOCKING_WAIT"] = "1"
+os.environ["NCCL_TIMEOUT"] = "1800"
 import time
+from datetime import timedelta
 from pathlib import Path
-from typing import List
+from typing import Iterable, List
 
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 import torch.optim as optim
+from torch.cuda.amp import GradScaler, autocast
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
@@ -22,6 +36,8 @@ DEFAULT_DATA_ROOTS = ("datasets/flickr2k", "datasets/coco", "datasets/div2k")
 MIN_BATCHES_PER_EPOCH = 10
 MIN_CHECKPOINT_MB = 80.0
 MAX_CHECKPOINT_MB = 150.0
+IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".tif", ".webp"}
+TENSOR_EXTENSIONS = {".pt", ".pth", ".npy", ".npz"}
 
 
 class VGGPerceptualLoss(torch.nn.Module):
@@ -72,13 +88,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--data-roots", type=str, nargs="+", default=list(DEFAULT_DATA_ROOTS))
     parser.add_argument("--checkpoint-dir", type=str, default="checkpoints")
     parser.add_argument("--run-name", type=str, default=STAGE_NAME)
-    parser.add_argument("--num-workers", type=int, default=4)
-    parser.add_argument("--grad-log-interval", type=int, default=20)
+    parser.add_argument("--num-workers", type=int, default=0)
+    parser.add_argument("--grad-log-interval", type=int, default=100)
+    parser.add_argument("--perf-log-interval", type=int, default=50)
     parser.add_argument("--image-size", type=int, default=256)
     parser.add_argument("--perceptual-weight", type=float, default=0.1)
     parser.add_argument("--colorfulness-weight", type=float, default=0.05)
+    parser.add_argument("--accum-steps", type=int, default=1)
+    parser.add_argument("--ddp-bucket-cap-mb", type=int, default=75)
     parser.add_argument("--disable-perceptual-loss", action="store_true")
     parser.add_argument("--resume", type=str, default=None, help="Resume from a specific checkpoint path.")
+    parser.add_argument("--auto-optimize", action="store_true", help="Enable performance-oriented runtime hints.")
+    parser.add_argument("--debug-grad", action="store_true", help="Enable periodic grad norm logging.")
+    parser.add_argument("--compile", action="store_true", help="Compile model with torch.compile.")
+    parser.add_argument("--dataset-cache", action="store_true", help="Enable dataset caching hook when available.")
+    parser.add_argument("--cuda-graphs", action="store_true", help="Enable CUDA Graphs when static-shape safe.")
     return parser.parse_args()
 
 
@@ -97,7 +121,9 @@ def save_checkpoint(
         "best_metric": best_metric,
         "loss": float(loss_value),
     }
-    torch.save(checkpoint, path)
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    torch.save(checkpoint, tmp_path)
+    os.replace(tmp_path, path)
 
 
 def load_checkpoint(path: Path, model: torch.nn.Module, optimizer: torch.optim.Optimizer, device: torch.device):
@@ -223,13 +249,147 @@ def compute_grad_norm(model: torch.nn.Module) -> float:
     return total if count > 0 else 0.0
 
 
-def run_sanity_check(loader: DataLoader, model: DDP, device: torch.device, rank: int) -> None:
-    sample_l, _ = next(iter(loader))
-    sample_l = sample_l.to(device, non_blocking=True)
+def run_sanity_check(sample_l: torch.Tensor, model: DDP, rank: int) -> None:
     with torch.no_grad():
         output = model(sample_l)
     if rank == 0:
         print(f"Sanity check output shape: {tuple(output.shape)}")
+
+
+def make_worker_init_fn(rank: int, world_size: int, num_workers: int):
+    def _init_fn(worker_id: int) -> None:
+        if not hasattr(os, "sched_setaffinity") or not hasattr(os, "sched_getaffinity"):
+            return
+        try:
+            available_cores = sorted(list(os.sched_getaffinity(0)))
+            if len(available_cores) == 0:
+                return
+            global_worker_id = (rank % max(world_size, 1)) * max(num_workers, 1) + worker_id
+            target_core = available_cores[global_worker_id % len(available_cores)]
+            os.sched_setaffinity(0, {target_core})
+        except Exception:
+            return
+
+    return _init_fn
+
+
+class PrefetchLoader:
+    def __init__(self, loader: DataLoader, device: torch.device):
+        if not getattr(loader, "pin_memory", False):
+            raise RuntimeError("PrefetchLoader requires DataLoader(pin_memory=True).")
+        self.loader = loader
+        self.device = device
+        self.stream = torch.cuda.Stream(device=device, priority=-1)
+        self.next_l = None
+        self.next_ab = None
+
+    def __len__(self) -> int:
+        return len(self.loader)
+
+    def _preload(self, iterator) -> None:
+        try:
+            next_l, next_ab = next(iterator)
+        except StopIteration:
+            self.next_l = None
+            self.next_ab = None
+            return
+
+        with torch.cuda.stream(self.stream):
+            self.next_l = next_l.to(self.device, non_blocking=True)
+            self.next_ab = next_ab.to(self.device, non_blocking=True)
+
+    def __iter__(self):
+        iterator = iter(self.loader)
+        self._preload(iterator)
+        while self.next_l is not None:
+            torch.cuda.current_stream(self.device).wait_stream(self.stream)
+            l_channel = self.next_l
+            ab_target = self.next_ab
+            l_channel.record_stream(torch.cuda.current_stream(self.device))
+            ab_target.record_stream(torch.cuda.current_stream(self.device))
+            self._preload(iterator)
+            yield l_channel, ab_target
+
+
+def _iter_cache_candidates(root: Path, include_tensors: bool) -> Iterable[Path]:
+    allowed_ext = IMAGE_EXTENSIONS | (TENSOR_EXTENSIONS if include_tensors else set())
+    for path in root.rglob("*"):
+        if path.is_file() and path.suffix.lower() in allowed_ext:
+            yield path
+
+
+def _rank_shard_for_path(path: Path, num_shards: int) -> int:
+    if num_shards <= 1:
+        return 0
+    digest = hashlib.md5(str(path).encode("utf-8")).hexdigest()
+    return int(digest, 16) % num_shards
+
+
+def prepare_node_local_cache(
+    data_roots: List[str],
+    local_rank: int,
+    local_world_size: int,
+    include_tensors: bool = False,
+) -> List[str]:
+    node_name = socket.gethostname().split(".")[0]
+    cache_base = Path("/tmp") / node_name
+    cache_base.mkdir(parents=True, exist_ok=True)
+
+    localized_roots: List[str] = []
+    for root_str in data_roots:
+        src_root = Path(root_str).resolve()
+        src_name = src_root.name
+        shard_root = cache_base / src_name / f"shard_{local_rank}"
+        shard_root.parent.mkdir(parents=True, exist_ok=True)
+        ready_file = shard_root / ".cache_ready"
+        lock_file = shard_root.parent / f".shard_{local_rank}.lock"
+        if ready_file.exists():
+            localized_roots.append(str(shard_root))
+            continue
+
+        lock_fd = None
+        wait_start = time.time()
+        while lock_fd is None:
+            if ready_file.exists():
+                localized_roots.append(str(shard_root))
+                break
+            try:
+                lock_fd = os.open(str(lock_file), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            except FileExistsError:
+                if time.time() - wait_start > 1800:
+                    raise TimeoutError(f"Timeout waiting for cache lock: {lock_file}")
+                time.sleep(2)
+                continue
+
+        if ready_file.exists():
+            continue
+
+        try:
+            tmp_root = shard_root.with_name(shard_root.name + ".tmp")
+            if tmp_root.exists():
+                shutil.rmtree(tmp_root)
+            tmp_root.mkdir(parents=True, exist_ok=True)
+
+            for source_file in _iter_cache_candidates(src_root, include_tensors):
+                rel_path = source_file.relative_to(src_root)
+                if _rank_shard_for_path(rel_path, max(local_world_size, 1)) != local_rank:
+                    continue
+                target_path = tmp_root / rel_path
+                target_path.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(source_file, target_path)
+
+            if shard_root.exists():
+                shutil.rmtree(shard_root)
+            os.replace(tmp_root, shard_root)
+            ready_file.touch()
+            localized_roots.append(str(shard_root))
+        finally:
+            if lock_fd is not None:
+                os.close(lock_fd)
+            if lock_file.exists():
+                lock_file.unlink()
+
+    return localized_roots
 
 
 def main() -> None:
@@ -238,20 +398,52 @@ def main() -> None:
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required for this DDP training script (backend=nccl).")
 
+    torch.set_num_threads(1)
+    try:
+        torch.set_num_interop_threads(1)
+    except RuntimeError:
+        pass
+
     data_roots: List[str] = [args.data_root] if args.data_root else args.data_roots
     if len(data_roots) == 0:
         raise RuntimeError("No dataset roots configured for Stage1 training.")
 
     local_rank = int(os.environ["LOCAL_RANK"])
-    dist.init_process_group(backend="nccl")
+    local_world_size = int(os.environ.get("LOCAL_WORLD_SIZE", "1"))
+    # Increase PG timeout to tolerate temporary cluster stalls/restarts.
+    pg_timeout = torch.timedelta(seconds=1800) if hasattr(torch, "timedelta") else timedelta(seconds=1800)
+    dist.init_process_group(backend="nccl", timeout=pg_timeout)
     rank = int(os.environ["RANK"])
     world_size = int(os.environ["WORLD_SIZE"])
 
     torch.cuda.set_device(local_rank)
     device = torch.device(f"cuda:{local_rank}")
     torch.backends.cudnn.benchmark = True
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    torch.set_float32_matmul_precision("high")
 
     try:
+        if args.dataset_cache:
+            data_roots = prepare_node_local_cache(
+                data_roots=data_roots,
+                local_rank=local_rank,
+                local_world_size=local_world_size,
+                include_tensors=True,
+            )
+            dist.barrier()
+            node_name = socket.gethostname().split(".")[0]
+            merged_roots: List[str] = []
+            for original_root in ([args.data_root] if args.data_root else args.data_roots):
+                src_name = Path(original_root).resolve().name
+                shard_parent = Path("/tmp") / node_name / src_name
+                for shard_idx in range(max(local_world_size, 1)):
+                    shard_dir = shard_parent / f"shard_{shard_idx}"
+                    if shard_dir.exists():
+                        merged_roots.append(str(shard_dir))
+            if len(merged_roots) > 0:
+                data_roots = merged_roots
+
         dataset, dataset_stats = build_combined_colorization_dataset(
             data_roots=data_roots,
             augment=True,
@@ -263,16 +455,29 @@ def main() -> None:
 
         sampler = DistributedSampler(dataset, shuffle=True)
 
-        num_workers = max(0, min(args.num_workers, (os.cpu_count() or 1) // max(world_size, 1)))
-        loader = DataLoader(
-            dataset,
-            batch_size=args.batch_size,
-            sampler=sampler,
-            num_workers=num_workers,
-            pin_memory=True,
-            persistent_workers=num_workers > 0,
-            drop_last=False,
-        )
+        # Worker cap to avoid CPU oversubscription in multi-GPU jobs while keeping input aggressive.
+        cpu_count = os.cpu_count() or 1
+        dynamic_workers = max(1, cpu_count // max(world_size, 1))
+        num_workers = dynamic_workers if args.num_workers <= 0 else max(1, min(args.num_workers, dynamic_workers))
+        if args.auto_optimize and rank == 0:
+            print(
+                f"[AUTO-OPTIMIZE] cpu_count={cpu_count}, world_size={world_size}, "
+                f"selected_num_workers={num_workers}"
+            )
+
+        loader_kwargs = {
+            "dataset": dataset,
+            "batch_size": args.batch_size,
+            "sampler": sampler,
+            "num_workers": num_workers,
+            "pin_memory": True,
+            "persistent_workers": True,
+            "prefetch_factor": 4,
+            "worker_init_fn": make_worker_init_fn(rank=rank, world_size=world_size, num_workers=num_workers),
+            "drop_last": False,
+        }
+        raw_loader = DataLoader(**loader_kwargs)
+        loader = PrefetchLoader(raw_loader, device=device)
 
         steps_per_epoch = len(loader)
         if steps_per_epoch == 0:
@@ -280,7 +485,7 @@ def main() -> None:
         if steps_per_epoch < MIN_BATCHES_PER_EPOCH:
             raise RuntimeError("Dataset too small")
 
-        first_batch = next(iter(loader))
+        first_batch = next(iter(raw_loader))
         first_batch_shape = tuple(first_batch[0].shape)
         image_resolution = f"{first_batch_shape[-2]}x{first_batch_shape[-1]}"
 
@@ -328,6 +533,15 @@ def main() -> None:
         # === RESUME SYSTEM START ===
         resume_path = Path(args.resume) if args.resume is not None else None
         # === RESUME SYSTEM END ===
+        ddp_bucket_cap_mb = max(50, min(int(args.ddp_bucket_cap_mb), 100))
+        compile_enabled = False
+        if args.compile and hasattr(torch, "compile"):
+            major_cc, _ = torch.cuda.get_device_capability(device)
+            compile_enabled = major_cc >= 8
+            if rank == 0 and not compile_enabled:
+                print("[WARN] torch.compile requested but GPU is pre-Ampere. Skipping compile.")
+        if args.cuda_graphs and rank == 0:
+            print("[WARN] CUDA Graphs require static-shape batches; currently disabled with drop_last=False.")
 
         if resume_path is not None:
             model = UNetColorizer(in_channels=1, out_channels=2)
@@ -339,10 +553,30 @@ def main() -> None:
             dist.barrier()
             model = model.to(device)
             _move_optimizer_state_to_device(optimizer, device)
-            model = DDP(model, device_ids=[local_rank])
+            if compile_enabled:
+                model = torch.compile(model, mode="reduce-overhead")
+            # DDP runtime options tuned for faster all-reduce behavior.
+            model = DDP(
+                model,
+                device_ids=[local_rank],
+                broadcast_buffers=False,
+                gradient_as_bucket_view=True,
+                bucket_cap_mb=ddp_bucket_cap_mb,
+                find_unused_parameters=False,
+            )
         else:
             model = UNetColorizer(in_channels=1, out_channels=2).cuda(local_rank)
-            model = DDP(model, device_ids=[local_rank])
+            if compile_enabled:
+                model = torch.compile(model, mode="reduce-overhead")
+            # DDP runtime options tuned for faster all-reduce behavior.
+            model = DDP(
+                model,
+                device_ids=[local_rank],
+                broadcast_buffers=False,
+                gradient_as_bucket_view=True,
+                bucket_cap_mb=ddp_bucket_cap_mb,
+                find_unused_parameters=False,
+            )
             optimizer = optim.SGD(model.parameters(), lr=args.lr, momentum=0.0, weight_decay=1e-5)
 
         total_params = sum(p.numel() for p in model.parameters())
@@ -359,7 +593,25 @@ def main() -> None:
         if rank == 0 and not perceptual_loss_fn.enabled:
             print("[WARN] Perceptual loss disabled.")
 
-        run_sanity_check(loader, model, device, rank)
+        # Mixed precision scaler for faster training while keeping stability.
+        scaler = GradScaler(enabled=True)
+        accum_steps = max(1, int(args.accum_steps))
+
+        run_sanity_check(first_batch[0].to(device, non_blocking=True), model, rank)
+        warmup_steps = min(3, steps_per_epoch)
+        if warmup_steps > 0:
+            model.eval()
+            with torch.no_grad():
+                warmup_iter = iter(loader)
+                for _ in range(warmup_steps):
+                    try:
+                        warm_l, _ = next(warmup_iter)
+                    except StopIteration:
+                        break
+                    with autocast(enabled=True):
+                        _ = model(warm_l)
+            torch.cuda.synchronize(device)
+            model.train()
 
         ckpt_dir = Path(args.checkpoint_dir)
         ckpt_dir.mkdir(parents=True, exist_ok=True)
@@ -385,62 +637,119 @@ def main() -> None:
             epoch_start = time.time()
             sampler.set_epoch(epoch)
             model.train()
+            torch.cuda.reset_peak_memory_stats(device)
 
             running_loss = 0.0
             running_l1_loss = 0.0
             running_perceptual_loss = 0.0
             running_colorfulness = 0.0
+            running_data_time = 0.0
+            running_compute_time = 0.0
             zero_grad_counter = 0
+            grad_sync_steps = 0
+            accum_counter = 0
+            optimizer.zero_grad(set_to_none=True)
+            step_clock = time.perf_counter()
 
             for step, (l_channel, ab_target) in enumerate(loader, start=1):
-                l_channel = l_channel.to(device, non_blocking=True)
-                ab_target = ab_target.to(device, non_blocking=True)
+                data_time = time.perf_counter() - step_clock
+                running_data_time += data_time
+                accum_counter += 1
+                sync_gradients = accum_counter >= accum_steps or step == steps_per_epoch
+                accumulation_divisor = accum_counter if sync_gradients else accum_steps
+                compute_start = time.perf_counter()
+                ddp_sync_context = contextlib.nullcontext() if sync_gradients else model.no_sync()
 
-                optimizer.zero_grad(set_to_none=True)
-                ab_pred = model(l_channel)
-                l1_loss = criterion(ab_pred, ab_target)
-                p_loss = perceptual_loss_fn(ab_pred, ab_target, l_channel)
-                colorfulness = torch.mean(torch.sqrt(ab_pred[:, 0] ** 2 + ab_pred[:, 1] ** 2 + 1e-8))
-                loss = l1_loss + args.perceptual_weight * p_loss + args.colorfulness_weight * colorfulness
-                if torch.isnan(loss):
-                    raise RuntimeError("NaN loss detected")
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                # AMP forward/loss path to accelerate tensor-core capable GPUs.
+                with ddp_sync_context:
+                    with autocast(enabled=True):
+                        ab_pred = model(l_channel)
+                        l1_loss = criterion(ab_pred, ab_target)
+                        p_loss = perceptual_loss_fn(ab_pred, ab_target, l_channel)
+                        colorfulness = torch.mean(torch.sqrt(ab_pred[:, 0] ** 2 + ab_pred[:, 1] ** 2 + 1e-8))
+                        total_loss = l1_loss + args.perceptual_weight * p_loss + args.colorfulness_weight * colorfulness
+                        loss = total_loss / accumulation_divisor
+                    if not torch.isfinite(total_loss):
+                        raise RuntimeError("Non-finite loss detected")
+                    scaler.scale(loss).backward()
 
-                grad_norm = compute_grad_norm(model)
-                if step % args.grad_log_interval == 0 and rank == 0:
-                    print(f"Grad norm: {grad_norm:.6e}")
+                compute_time = time.perf_counter() - compute_start
+                running_compute_time += compute_time
 
-                if grad_norm <= 1e-12:
-                    zero_grad_counter += 1
-                    if zero_grad_counter >= 5:
-                        raise RuntimeError("Gradients are zero for 5 consecutive checks. Stopping training.")
-                else:
-                    zero_grad_counter = 0
+                if sync_gradients:
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
 
-                optimizer.step()
-                running_loss += float(loss.item())
+                    # Grad diagnostics are opt-in to avoid per-step CPU overhead.
+                    if args.debug_grad and step % max(1, args.grad_log_interval) == 0:
+                        grad_norm = compute_grad_norm(model)
+                        if rank == 0:
+                            print(f"Grad norm (step {step}): {grad_norm:.6e}")
+                        if grad_norm <= 1e-12:
+                            zero_grad_counter += 1
+                            if zero_grad_counter >= 5:
+                                raise RuntimeError("Gradients are zero for 5 consecutive checks. Stopping training.")
+                        else:
+                            zero_grad_counter = 0
+
+                    scaler.step(optimizer)
+                    scaler.update()
+                    optimizer.zero_grad(set_to_none=True)
+                    accum_counter = 0
+                    grad_sync_steps += 1
+
+                running_loss += float(total_loss.item())
                 running_l1_loss += float(l1_loss.item())
                 running_perceptual_loss += float(p_loss.item())
                 running_colorfulness += float(colorfulness.item())
+                if rank == 0 and step % max(1, args.perf_log_interval) == 0:
+                    max_mem_gb = torch.cuda.max_memory_allocated(device) / (1024 ** 3)
+                    bottleneck = "data" if running_data_time > running_compute_time else "compute"
+                    print(
+                        f"[PERF] epoch={epoch + 1} step={step}/{steps_per_epoch} "
+                        f"data={1000.0 * running_data_time / step:.1f}ms "
+                        f"compute={1000.0 * running_compute_time / step:.1f}ms "
+                        f"sync_steps={grad_sync_steps} "
+                        f"max_mem={max_mem_gb:.2f}GB bottleneck={bottleneck}"
+                    )
+                step_clock = time.perf_counter()
 
-            stats = torch.tensor([running_loss, running_l1_loss, running_perceptual_loss, running_colorfulness], device=device)
+            stats = torch.tensor(
+                [
+                    running_loss,
+                    running_l1_loss,
+                    running_perceptual_loss,
+                    running_colorfulness,
+                    running_data_time,
+                    running_compute_time,
+                ],
+                device=device,
+            )
             dist.all_reduce(stats, op=dist.ReduceOp.SUM)
             denom = world_size * max(steps_per_epoch, 1)
             avg_loss = float(stats[0].item()) / denom
             avg_l1_loss = float(stats[1].item()) / denom
             avg_perceptual_loss = float(stats[2].item()) / denom
             avg_colorfulness = float(stats[3].item()) / denom
+            avg_data_time = float(stats[4].item()) / denom
+            avg_compute_time = float(stats[5].item()) / denom
             epoch_time = time.time() - epoch_start
 
             if rank == 0:
                 print(
                     f"Epoch [{epoch + 1}/{args.epochs}] | Loss: {avg_loss:.6f} "
                     f"(L1: {avg_l1_loss:.6f}, P: {avg_perceptual_loss:.6f}, C: {avg_colorfulness:.6f}) "
-                    f"| Steps: {steps_per_epoch} | Time: {epoch_time:.1f}s"
+                    f"| Steps: {steps_per_epoch} | Time: {epoch_time:.1f}s | "
+                    f"AvgData: {1000.0 * avg_data_time:.1f}ms | AvgCompute: {1000.0 * avg_compute_time:.1f}ms"
                 )
+                # Runtime guardrail: warn and suggest a safer worker count for next restart.
+                if epoch_time > 800.0:
+                    suggested_workers = max(1, num_workers // 2) if num_workers > 0 else 0
+                    print(
+                        f"[WARN] Slow epoch detected ({epoch_time:.1f}s > 800s). "
+                        f"Suggested --num-workers {suggested_workers} for next restart."
+                    )
 
-            dist.barrier()
             if dist.get_rank() == 0:
                 current_epoch = epoch
                 is_best = avg_loss < best_loss
