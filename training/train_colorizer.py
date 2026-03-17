@@ -78,6 +78,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--perceptual-weight", type=float, default=0.1)
     parser.add_argument("--colorfulness-weight", type=float, default=0.05)
     parser.add_argument("--disable-perceptual-loss", action="store_true")
+    parser.add_argument("--resume", type=str, default=None, help="Resume from a specific checkpoint path.")
     return parser.parse_args()
 
 
@@ -110,6 +111,93 @@ def load_checkpoint(path: Path, model: torch.nn.Module, optimizer: torch.optim.O
     start_epoch = int(checkpoint["epoch"]) + 1
     best_metric = float(checkpoint.get("best_metric", float("inf")))
     return start_epoch, best_metric
+
+
+# === RESUME SYSTEM START ===
+def _strip_module_prefix_if_needed(state_dict: dict, model: torch.nn.Module) -> dict:
+    if not isinstance(state_dict, dict):
+        return state_dict
+    model_keys = list(model.state_dict().keys())
+    if len(model_keys) == 0:
+        return state_dict
+
+    model_has_module_prefix = any(key.startswith("module.") for key in model_keys)
+    checkpoint_has_module_prefix = any(key.startswith("module.") for key in state_dict.keys())
+    if checkpoint_has_module_prefix and not model_has_module_prefix:
+        return {key[7:] if key.startswith("module.") else key: value for key, value in state_dict.items()}
+    return state_dict
+
+
+def _warn(rank: int, message: str) -> None:
+    if rank == 0:
+        print(f"[WARN] {message}")
+
+
+def _move_optimizer_state_to_device(optimizer: torch.optim.Optimizer, device: torch.device) -> None:
+    for state in optimizer.state.values():
+        for key, value in state.items():
+            if torch.is_tensor(value):
+                state[key] = value.to(device, non_blocking=True)
+
+
+def load_checkpoint_for_resume(
+    path: Path,
+    model: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+    rank: int,
+):
+    start_epoch = 0
+    best_metric = float("inf")
+
+    if not path.exists():
+        _warn(rank, f"Checkpoint not found: {path}. Starting from epoch 0.")
+        return start_epoch, best_metric
+
+    try:
+        checkpoint = torch.load(path, map_location="cpu")
+    except Exception as exc:
+        _warn(rank, f"Failed to load checkpoint {path}: {exc}. Starting from epoch 0.")
+        return start_epoch, best_metric
+
+    model_state_dict = checkpoint.get("model_state_dict")
+    if model_state_dict is None:
+        _warn(rank, "Missing key 'model_state_dict' in checkpoint. Using randomly initialized model.")
+    else:
+        try:
+            normalized_state = _strip_module_prefix_if_needed(model_state_dict, model)
+            load_result = model.load_state_dict(normalized_state, strict=False)
+            if len(load_result.missing_keys) > 0:
+                _warn(rank, f"Missing model keys during resume: {load_result.missing_keys}")
+            if len(load_result.unexpected_keys) > 0:
+                _warn(rank, f"Unexpected model keys during resume: {load_result.unexpected_keys}")
+        except Exception as exc:
+            _warn(rank, f"Failed to load model_state_dict: {exc}. Continuing without model weights.")
+
+    optimizer_state = checkpoint.get("optimizer_state_dict")
+    if optimizer_state is None:
+        _warn(rank, "Missing key 'optimizer_state_dict' in checkpoint. Optimizer will start fresh.")
+    else:
+        try:
+            optimizer.load_state_dict(optimizer_state)
+        except Exception as exc:
+            _warn(rank, f"Failed to load optimizer_state_dict: {exc}. Optimizer will start fresh.")
+
+    epoch_value = checkpoint.get("epoch", 0)
+    try:
+        start_epoch = int(epoch_value) + 1
+    except Exception:
+        _warn(rank, f"Invalid epoch value '{epoch_value}' in checkpoint. Starting from epoch 0.")
+        start_epoch = 0
+
+    try:
+        best_metric = float(checkpoint.get("best_metric", float("inf")))
+    except Exception:
+        best_metric = float("inf")
+
+    return start_epoch, best_metric
+
+
+# === RESUME SYSTEM END ===
 
 
 def validate_checkpoint_size(path: Path, min_mb: float = MIN_CHECKPOINT_MB, max_mb: float = MAX_CHECKPOINT_MB) -> float:
@@ -237,13 +325,31 @@ def main() -> None:
             print(f"Image resolution: {image_resolution}")
             print(f"First batch shape: {first_batch_shape}")
 
-        model = UNetColorizer(in_channels=1, out_channels=2).cuda(local_rank)
+        # === RESUME SYSTEM START ===
+        resume_path = Path(args.resume) if args.resume is not None else None
+        # === RESUME SYSTEM END ===
+
+        if resume_path is not None:
+            model = UNetColorizer(in_channels=1, out_channels=2)
+            optimizer = optim.SGD(model.parameters(), lr=args.lr, momentum=0.0, weight_decay=1e-5)
+            start_epoch, best_loss = load_checkpoint_for_resume(resume_path, model, optimizer, rank)
+            if rank == 0:
+                print(f"Loaded checkpoint: {resume_path}")
+                print(f"Resuming training from epoch {start_epoch}")
+            dist.barrier()
+            model = model.to(device)
+            _move_optimizer_state_to_device(optimizer, device)
+            model = DDP(model, device_ids=[local_rank])
+        else:
+            model = UNetColorizer(in_channels=1, out_channels=2).cuda(local_rank)
+            model = DDP(model, device_ids=[local_rank])
+            optimizer = optim.SGD(model.parameters(), lr=args.lr, momentum=0.0, weight_decay=1e-5)
+
         total_params = sum(p.numel() for p in model.parameters())
         if total_params < 1_000_000:
             raise RuntimeError("Model architecture incorrect")
         if rank == 0:
             print(f"Model parameters: {total_params:,}")
-        model = DDP(model, device_ids=[local_rank])
 
         criterion = torch.nn.L1Loss().to(device)
         perceptual_loss_fn = VGGPerceptualLoss().to(device)
@@ -253,8 +359,6 @@ def main() -> None:
         if rank == 0 and not perceptual_loss_fn.enabled:
             print("[WARN] Perceptual loss disabled.")
 
-        optimizer = optim.SGD(model.parameters(), lr=args.lr, momentum=0.0, weight_decay=1e-5)
-
         run_sanity_check(loader, model, device, rank)
 
         ckpt_dir = Path(args.checkpoint_dir)
@@ -262,9 +366,9 @@ def main() -> None:
         latest_path = ckpt_dir / f"{args.run_name}_latest.pth"
         best_path = ckpt_dir / f"{args.run_name}_best.pth"
 
-        start_epoch = 0
-        best_loss = float("inf")
-        if latest_path.exists():
+        start_epoch = 0 if resume_path is None else start_epoch
+        best_loss = float("inf") if resume_path is None else best_loss
+        if resume_path is None and latest_path.exists():
             if rank == 0:
                 print(f"Resuming from {latest_path}")
             start_epoch, best_loss = load_checkpoint(latest_path, model, optimizer, device)
