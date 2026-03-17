@@ -84,7 +84,7 @@ class VGGPerceptualLoss(torch.nn.Module):
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Stage 1: UNet colorizer DDP training")
-    parser.add_argument("--epochs", type=int, default=400)
+    parser.add_argument("--epochs", type=int, default=120)
     parser.add_argument("--batch-size", type=int, default=2)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--data-root", type=str, default=None, help="Legacy single-dataset override.")
