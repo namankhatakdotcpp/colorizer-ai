@@ -4,6 +4,7 @@ import hashlib
 import os
 import shutil
 import socket
+import traceback
 # Cap CPU thread fan-out to reduce contention on shared nodes.
 os.environ["OMP_NUM_THREADS"] = "1"
 os.environ["MKL_NUM_THREADS"] = "1"
@@ -12,6 +13,7 @@ os.environ["NCCL_DEBUG"] = "WARN"
 os.environ["NCCL_ASYNC_ERROR_HANDLING"] = "1"
 os.environ["NCCL_BLOCKING_WAIT"] = "1"
 os.environ["NCCL_TIMEOUT"] = "1800"
+os.environ["TORCH_DISTRIBUTED_DEBUG"] = "DETAIL"
 import time
 from datetime import timedelta
 from pathlib import Path
@@ -22,6 +24,7 @@ import torch.distributed as dist
 import torch.nn.functional as F
 import torch.optim as optim
 from torch.cuda.amp import GradScaler, autocast
+from torch.distributed.elastic.multiprocessing.errors import record
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
@@ -103,6 +106,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--compile", action="store_true", help="Compile model with torch.compile.")
     parser.add_argument("--dataset-cache", action="store_true", help="Enable dataset caching hook when available.")
     parser.add_argument("--cuda-graphs", action="store_true", help="Enable CUDA Graphs when static-shape safe.")
+    parser.add_argument("--debug-single", action="store_true", help="Run single-GPU debug mode without DDP.")
     return parser.parse_args()
 
 
@@ -249,7 +253,42 @@ def compute_grad_norm(model: torch.nn.Module) -> float:
     return total if count > 0 else 0.0
 
 
-def run_sanity_check(sample_l: torch.Tensor, model: DDP, rank: int) -> None:
+def _log_exception(rank: int, context: str) -> None:
+    print(f"[ERROR][rank={rank}] {context}\n{traceback.format_exc()}", flush=True)
+
+
+def _validate_batch(batch, rank: int, context: str):
+    if batch is None:
+        raise RuntimeError(f"{context}: batch is None")
+    if not isinstance(batch, (list, tuple)) or len(batch) != 2:
+        raise RuntimeError(f"{context}: expected (l_channel, ab_target), got {type(batch)} with len={len(batch) if hasattr(batch, '__len__') else 'N/A'}")
+    l_channel, ab_target = batch
+    if l_channel is None or ab_target is None:
+        raise RuntimeError(f"{context}: encountered None tensor in batch")
+    if not torch.is_tensor(l_channel) or not torch.is_tensor(ab_target):
+        raise RuntimeError(f"{context}: expected tensors, got {type(l_channel)} and {type(ab_target)}")
+    if l_channel.ndim != 4 or ab_target.ndim != 4:
+        raise RuntimeError(f"{context}: expected 4D tensors, got shapes {tuple(l_channel.shape)} and {tuple(ab_target.shape)}")
+    if l_channel.shape[0] != ab_target.shape[0]:
+        raise RuntimeError(f"{context}: batch size mismatch {l_channel.shape[0]} != {ab_target.shape[0]}")
+    if l_channel.shape[1] != 1:
+        raise RuntimeError(f"{context}: expected L channel with C=1, got {l_channel.shape[1]}")
+    if ab_target.shape[1] != 2:
+        raise RuntimeError(f"{context}: expected AB target with C=2, got {ab_target.shape[1]}")
+    return l_channel, ab_target
+
+
+def _validate_cache_roots(cache_roots: List[str], include_tensors: bool) -> None:
+    for cache_root_str in cache_roots:
+        cache_root = Path(cache_root_str)
+        if not cache_root.exists():
+            raise FileNotFoundError(f"Cache shard missing: {cache_root}")
+        file_count = sum(1 for _ in _iter_cache_candidates(cache_root, include_tensors=include_tensors))
+        if file_count == 0:
+            raise RuntimeError(f"Cache shard is empty: {cache_root}")
+
+
+def run_sanity_check(sample_l: torch.Tensor, model: torch.nn.Module, rank: int) -> None:
     with torch.no_grad():
         output = model(sample_l)
     if rank == 0:
@@ -288,11 +327,16 @@ class PrefetchLoader:
 
     def _preload(self, iterator) -> None:
         try:
-            next_l, next_ab = next(iterator)
+            next_batch = next(iterator)
         except StopIteration:
             self.next_l = None
             self.next_ab = None
             return
+        if not isinstance(next_batch, (list, tuple)) or len(next_batch) != 2:
+            raise RuntimeError(f"PrefetchLoader expected (l_channel, ab_target), got {type(next_batch)}")
+        next_l, next_ab = next_batch
+        if next_l is None or next_ab is None:
+            raise RuntimeError("PrefetchLoader got None tensors from upstream loader")
 
         with torch.cuda.stream(self.stream):
             self.next_l = next_l.to(self.device, non_blocking=True)
@@ -392,11 +436,12 @@ def prepare_node_local_cache(
     return localized_roots
 
 
-def main() -> None:
-    args = parse_args()
+@record
+def main(args: argparse.Namespace | None = None) -> None:
+    args = parse_args() if args is None else args
 
     if not torch.cuda.is_available():
-        raise RuntimeError("CUDA is required for this DDP training script (backend=nccl).")
+        raise RuntimeError("CUDA is required for this training script.")
 
     torch.set_num_threads(1)
     try:
@@ -407,14 +452,31 @@ def main() -> None:
     data_roots: List[str] = [args.data_root] if args.data_root else args.data_roots
     if len(data_roots) == 0:
         raise RuntimeError("No dataset roots configured for Stage1 training.")
+    for root in data_roots:
+        if not Path(root).exists():
+            raise FileNotFoundError(f"Dataset root does not exist: {root}")
 
-    local_rank = int(os.environ["LOCAL_RANK"])
-    local_world_size = int(os.environ.get("LOCAL_WORLD_SIZE", "1"))
-    # Increase PG timeout to tolerate temporary cluster stalls/restarts.
-    pg_timeout = torch.timedelta(seconds=1800) if hasattr(torch, "timedelta") else timedelta(seconds=1800)
-    dist.init_process_group(backend="nccl", timeout=pg_timeout)
-    rank = int(os.environ["RANK"])
-    world_size = int(os.environ["WORLD_SIZE"])
+    ddp_enabled = not args.debug_single
+    if ddp_enabled:
+        required_env = ("LOCAL_RANK", "RANK", "WORLD_SIZE")
+        missing = [k for k in required_env if k not in os.environ]
+        if missing:
+            raise RuntimeError(
+                f"Missing torchrun environment variables: {missing}. "
+                "Launch with torchrun or use --debug-single."
+            )
+        local_rank = int(os.environ["LOCAL_RANK"])
+        local_world_size = int(os.environ.get("LOCAL_WORLD_SIZE", "1"))
+        pg_timeout = torch.timedelta(seconds=1800) if hasattr(torch, "timedelta") else timedelta(seconds=1800)
+        dist.init_process_group(backend="nccl", timeout=pg_timeout)
+        rank = int(os.environ["RANK"])
+        world_size = int(os.environ["WORLD_SIZE"])
+    else:
+        local_rank = 0
+        local_world_size = 1
+        rank = 0
+        world_size = 1
+        print("[DEBUG] Running --debug-single mode (DDP disabled).")
 
     torch.cuda.set_device(local_rank)
     device = torch.device(f"cuda:{local_rank}")
@@ -425,37 +487,48 @@ def main() -> None:
 
     try:
         if args.dataset_cache:
-            data_roots = prepare_node_local_cache(
-                data_roots=data_roots,
-                local_rank=local_rank,
-                local_world_size=local_world_size,
-                include_tensors=True,
-            )
-            dist.barrier()
-            node_name = socket.gethostname().split(".")[0]
-            merged_roots: List[str] = []
-            for original_root in ([args.data_root] if args.data_root else args.data_roots):
-                src_name = Path(original_root).resolve().name
-                shard_parent = Path("/tmp") / node_name / src_name
-                for shard_idx in range(max(local_world_size, 1)):
-                    shard_dir = shard_parent / f"shard_{shard_idx}"
-                    if shard_dir.exists():
-                        merged_roots.append(str(shard_dir))
-            if len(merged_roots) > 0:
-                data_roots = merged_roots
+            try:
+                data_roots = prepare_node_local_cache(
+                    data_roots=data_roots,
+                    local_rank=local_rank,
+                    local_world_size=local_world_size,
+                    include_tensors=True,
+                )
+                if ddp_enabled:
+                    dist.barrier()
+                node_name = socket.gethostname().split(".")[0]
+                merged_roots: List[str] = []
+                for original_root in ([args.data_root] if args.data_root else args.data_roots):
+                    src_name = Path(original_root).resolve().name
+                    shard_parent = Path("/tmp") / node_name / src_name
+                    for shard_idx in range(max(local_world_size, 1)):
+                        shard_dir = shard_parent / f"shard_{shard_idx}"
+                        if shard_dir.exists():
+                            merged_roots.append(str(shard_dir))
+                if len(merged_roots) > 0:
+                    data_roots = merged_roots
+                _validate_cache_roots(data_roots, include_tensors=True)
+            except Exception:
+                _log_exception(rank, "dataset cache preparation failed")
+                raise
 
-        dataset, dataset_stats = build_combined_colorization_dataset(
-            data_roots=data_roots,
-            augment=True,
-            image_size=args.image_size,
-            warn_min_total_samples=50000,
-        )
+        try:
+            dataset, dataset_stats = build_combined_colorization_dataset(
+                data_roots=data_roots,
+                augment=True,
+                image_size=args.image_size,
+                warn_min_total_samples=50000,
+            )
+        except Exception:
+            _log_exception(rank, "dataset creation failed")
+            raise
         if len(dataset) == 0:
             raise RuntimeError("Dataset is empty")
+        if rank == 0:
+            print(f"Dataset length: {len(dataset)}")
 
-        sampler = DistributedSampler(dataset, shuffle=True)
+        sampler = DistributedSampler(dataset, shuffle=True) if ddp_enabled else None
 
-        # Worker cap to avoid CPU oversubscription in multi-GPU jobs while keeping input aggressive.
         cpu_count = os.cpu_count() or 1
         dynamic_workers = max(1, cpu_count // max(world_size, 1))
         num_workers = dynamic_workers if args.num_workers <= 0 else max(1, min(args.num_workers, dynamic_workers))
@@ -468,7 +541,6 @@ def main() -> None:
         loader_kwargs = {
             "dataset": dataset,
             "batch_size": args.batch_size,
-            "sampler": sampler,
             "num_workers": num_workers,
             "pin_memory": True,
             "persistent_workers": True,
@@ -476,18 +548,32 @@ def main() -> None:
             "worker_init_fn": make_worker_init_fn(rank=rank, world_size=world_size, num_workers=num_workers),
             "drop_last": False,
         }
-        raw_loader = DataLoader(**loader_kwargs)
-        loader = PrefetchLoader(raw_loader, device=device)
+        if sampler is not None:
+            loader_kwargs["sampler"] = sampler
+        else:
+            loader_kwargs["shuffle"] = True
 
-        steps_per_epoch = len(loader)
-        if steps_per_epoch == 0:
-            raise RuntimeError("No batches produced")
-        if steps_per_epoch < MIN_BATCHES_PER_EPOCH:
-            raise RuntimeError("Dataset too small")
+        try:
+            raw_loader = DataLoader(**loader_kwargs)
+            loader = PrefetchLoader(raw_loader, device=device)
+        except Exception:
+            _log_exception(rank, "dataloader creation failed")
+            raise
 
-        first_batch = next(iter(raw_loader))
-        first_batch_shape = tuple(first_batch[0].shape)
-        image_resolution = f"{first_batch_shape[-2]}x{first_batch_shape[-1]}"
+        try:
+            steps_per_epoch = len(loader)
+            if steps_per_epoch == 0:
+                raise RuntimeError("No batches produced")
+            if steps_per_epoch < MIN_BATCHES_PER_EPOCH:
+                raise RuntimeError("Dataset too small")
+
+            first_batch = next(iter(raw_loader))
+            first_l, first_ab = _validate_batch(first_batch, rank, "first batch validation")
+            first_batch_shape = tuple(first_l.shape)
+            image_resolution = f"{first_batch_shape[-2]}x{first_batch_shape[-1]}"
+        except Exception:
+            _log_exception(rank, "first batch fetch/validation failed")
+            raise
 
         if rank == 0:
             print("Stage1 datasets:")
@@ -550,33 +636,34 @@ def main() -> None:
             if rank == 0:
                 print(f"Loaded checkpoint: {resume_path}")
                 print(f"Resuming training from epoch {start_epoch}")
-            dist.barrier()
+            if ddp_enabled:
+                dist.barrier()
             model = model.to(device)
             _move_optimizer_state_to_device(optimizer, device)
             if compile_enabled:
                 model = torch.compile(model, mode="reduce-overhead")
-            # DDP runtime options tuned for faster all-reduce behavior.
-            model = DDP(
-                model,
-                device_ids=[local_rank],
-                broadcast_buffers=False,
-                gradient_as_bucket_view=True,
-                bucket_cap_mb=ddp_bucket_cap_mb,
-                find_unused_parameters=False,
-            )
+            if ddp_enabled:
+                model = DDP(
+                    model,
+                    device_ids=[local_rank],
+                    broadcast_buffers=False,
+                    gradient_as_bucket_view=True,
+                    bucket_cap_mb=ddp_bucket_cap_mb,
+                    find_unused_parameters=False,
+                )
         else:
-            model = UNetColorizer(in_channels=1, out_channels=2).cuda(local_rank)
+            model = UNetColorizer(in_channels=1, out_channels=2).to(device)
             if compile_enabled:
                 model = torch.compile(model, mode="reduce-overhead")
-            # DDP runtime options tuned for faster all-reduce behavior.
-            model = DDP(
-                model,
-                device_ids=[local_rank],
-                broadcast_buffers=False,
-                gradient_as_bucket_view=True,
-                bucket_cap_mb=ddp_bucket_cap_mb,
-                find_unused_parameters=False,
-            )
+            if ddp_enabled:
+                model = DDP(
+                    model,
+                    device_ids=[local_rank],
+                    broadcast_buffers=False,
+                    gradient_as_bucket_view=True,
+                    bucket_cap_mb=ddp_bucket_cap_mb,
+                    find_unused_parameters=False,
+                )
             optimizer = optim.SGD(model.parameters(), lr=args.lr, momentum=0.0, weight_decay=1e-5)
 
         total_params = sum(p.numel() for p in model.parameters())
@@ -593,25 +680,34 @@ def main() -> None:
         if rank == 0 and not perceptual_loss_fn.enabled:
             print("[WARN] Perceptual loss disabled.")
 
-        # Mixed precision scaler for faster training while keeping stability.
         scaler = GradScaler(enabled=True)
         accum_steps = max(1, int(args.accum_steps))
 
-        run_sanity_check(first_batch[0].to(device, non_blocking=True), model, rank)
+        try:
+            run_sanity_check(first_l.to(device, non_blocking=True), model, rank)
+        except Exception:
+            _log_exception(rank, "sanity forward pass failed")
+            raise
+
         warmup_steps = min(3, steps_per_epoch)
         if warmup_steps > 0:
-            model.eval()
-            with torch.no_grad():
-                warmup_iter = iter(loader)
-                for _ in range(warmup_steps):
-                    try:
-                        warm_l, _ = next(warmup_iter)
-                    except StopIteration:
-                        break
-                    with autocast(enabled=True):
-                        _ = model(warm_l)
-            torch.cuda.synchronize(device)
-            model.train()
+            try:
+                model.eval()
+                with torch.no_grad():
+                    warmup_iter = iter(loader)
+                    for _ in range(warmup_steps):
+                        try:
+                            warm_batch = next(warmup_iter)
+                        except StopIteration:
+                            break
+                        warm_l, _ = _validate_batch(warm_batch, rank, "warmup batch validation")
+                        with autocast(enabled=True):
+                            _ = model(warm_l)
+                torch.cuda.synchronize(device)
+                model.train()
+            except Exception:
+                _log_exception(rank, "warmup forward failed")
+                raise
 
         ckpt_dir = Path(args.checkpoint_dir)
         ckpt_dir.mkdir(parents=True, exist_ok=True)
@@ -625,7 +721,8 @@ def main() -> None:
                 print(f"Resuming from {latest_path}")
             start_epoch, best_loss = load_checkpoint(latest_path, model, optimizer, device)
 
-        dist.barrier()
+        if ddp_enabled:
+            dist.barrier()
 
         if start_epoch >= args.epochs:
             raise RuntimeError(
@@ -635,7 +732,8 @@ def main() -> None:
 
         for epoch in range(start_epoch, args.epochs):
             epoch_start = time.time()
-            sampler.set_epoch(epoch)
+            if sampler is not None:
+                sampler.set_epoch(epoch)
             model.train()
             torch.cuda.reset_peak_memory_stats(device)
 
@@ -651,27 +749,33 @@ def main() -> None:
             optimizer.zero_grad(set_to_none=True)
             step_clock = time.perf_counter()
 
-            for step, (l_channel, ab_target) in enumerate(loader, start=1):
+            for step, batch in enumerate(loader, start=1):
+                l_channel, ab_target = _validate_batch(batch, rank, f"train batch epoch={epoch + 1} step={step}")
                 data_time = time.perf_counter() - step_clock
                 running_data_time += data_time
                 accum_counter += 1
                 sync_gradients = accum_counter >= accum_steps or step == steps_per_epoch
                 accumulation_divisor = accum_counter if sync_gradients else accum_steps
                 compute_start = time.perf_counter()
-                ddp_sync_context = contextlib.nullcontext() if sync_gradients else model.no_sync()
+                ddp_sync_context = contextlib.nullcontext() if (sync_gradients or not ddp_enabled) else model.no_sync()
 
-                # AMP forward/loss path to accelerate tensor-core capable GPUs.
-                with ddp_sync_context:
-                    with autocast(enabled=True):
-                        ab_pred = model(l_channel)
-                        l1_loss = criterion(ab_pred, ab_target)
-                        p_loss = perceptual_loss_fn(ab_pred, ab_target, l_channel)
-                        colorfulness = torch.mean(torch.sqrt(ab_pred[:, 0] ** 2 + ab_pred[:, 1] ** 2 + 1e-8))
-                        total_loss = l1_loss + args.perceptual_weight * p_loss + args.colorfulness_weight * colorfulness
-                        loss = total_loss / accumulation_divisor
-                    if not torch.isfinite(total_loss):
-                        raise RuntimeError("Non-finite loss detected")
-                    scaler.scale(loss).backward()
+                try:
+                    with ddp_sync_context:
+                        with autocast(enabled=True):
+                            ab_pred = model(l_channel)
+                            l1_loss = criterion(ab_pred, ab_target)
+                            p_loss = perceptual_loss_fn(ab_pred, ab_target, l_channel)
+                            colorfulness = torch.mean(torch.sqrt(ab_pred[:, 0] ** 2 + ab_pred[:, 1] ** 2 + 1e-8))
+                            total_loss = (
+                                l1_loss + args.perceptual_weight * p_loss + args.colorfulness_weight * colorfulness
+                            )
+                            loss = total_loss / accumulation_divisor
+                        if not torch.isfinite(total_loss):
+                            raise RuntimeError("Non-finite loss detected")
+                        scaler.scale(loss).backward()
+                except Exception:
+                    _log_exception(rank, f"forward/backward failed at epoch={epoch + 1}, step={step}")
+                    raise
 
                 compute_time = time.perf_counter() - compute_start
                 running_compute_time += compute_time
@@ -680,7 +784,6 @@ def main() -> None:
                     scaler.unscale_(optimizer)
                     torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
 
-                    # Grad diagnostics are opt-in to avoid per-step CPU overhead.
                     if args.debug_grad and step % max(1, args.grad_log_interval) == 0:
                         grad_norm = compute_grad_norm(model)
                         if rank == 0:
@@ -714,25 +817,35 @@ def main() -> None:
                     )
                 step_clock = time.perf_counter()
 
-            stats = torch.tensor(
-                [
-                    running_loss,
-                    running_l1_loss,
-                    running_perceptual_loss,
-                    running_colorfulness,
-                    running_data_time,
-                    running_compute_time,
-                ],
-                device=device,
-            )
-            dist.all_reduce(stats, op=dist.ReduceOp.SUM)
-            denom = world_size * max(steps_per_epoch, 1)
-            avg_loss = float(stats[0].item()) / denom
-            avg_l1_loss = float(stats[1].item()) / denom
-            avg_perceptual_loss = float(stats[2].item()) / denom
-            avg_colorfulness = float(stats[3].item()) / denom
-            avg_data_time = float(stats[4].item()) / denom
-            avg_compute_time = float(stats[5].item()) / denom
+            if ddp_enabled:
+                stats = torch.tensor(
+                    [
+                        running_loss,
+                        running_l1_loss,
+                        running_perceptual_loss,
+                        running_colorfulness,
+                        running_data_time,
+                        running_compute_time,
+                    ],
+                    device=device,
+                )
+                dist.all_reduce(stats, op=dist.ReduceOp.SUM)
+                denom = world_size * max(steps_per_epoch, 1)
+                avg_loss = float(stats[0].item()) / denom
+                avg_l1_loss = float(stats[1].item()) / denom
+                avg_perceptual_loss = float(stats[2].item()) / denom
+                avg_colorfulness = float(stats[3].item()) / denom
+                avg_data_time = float(stats[4].item()) / denom
+                avg_compute_time = float(stats[5].item()) / denom
+            else:
+                denom = max(steps_per_epoch, 1)
+                avg_loss = running_loss / denom
+                avg_l1_loss = running_l1_loss / denom
+                avg_perceptual_loss = running_perceptual_loss / denom
+                avg_colorfulness = running_colorfulness / denom
+                avg_data_time = running_data_time / denom
+                avg_compute_time = running_compute_time / denom
+
             epoch_time = time.time() - epoch_start
 
             if rank == 0:
@@ -742,7 +855,6 @@ def main() -> None:
                     f"| Steps: {steps_per_epoch} | Time: {epoch_time:.1f}s | "
                     f"AvgData: {1000.0 * avg_data_time:.1f}ms | AvgCompute: {1000.0 * avg_compute_time:.1f}ms"
                 )
-                # Runtime guardrail: warn and suggest a safer worker count for next restart.
                 if epoch_time > 800.0:
                     suggested_workers = max(1, num_workers // 2) if num_workers > 0 else 0
                     print(
@@ -750,7 +862,7 @@ def main() -> None:
                         f"Suggested --num-workers {suggested_workers} for next restart."
                     )
 
-            if dist.get_rank() == 0:
+            if rank == 0:
                 current_epoch = epoch
                 is_best = avg_loss < best_loss
                 if is_best:
@@ -763,14 +875,19 @@ def main() -> None:
                 if is_best:
                     save_checkpoint(best_path, current_epoch, model, optimizer, best_loss, avg_loss)
                     validate_checkpoint_size(best_path, MIN_CHECKPOINT_MB)
-            dist.barrier()
+            if ddp_enabled:
+                dist.barrier()
     finally:
-        if dist.is_initialized():
+        if ddp_enabled and dist.is_initialized():
             dist.destroy_process_group()
 
 
 if __name__ == "__main__":
-    if "WORLD_SIZE" not in os.environ:
-        print("Please run with torchrun, e.g. torchrun --nproc_per_node=4 training/train_colorizer.py")
+    cli_args = parse_args()
+    if not cli_args.debug_single and "WORLD_SIZE" not in os.environ:
+        print(
+            "Please run with torchrun, e.g. torchrun --nproc_per_node=4 training/train_colorizer.py "
+            "or use --debug-single for single-GPU debugging."
+        )
     else:
-        main()
+        main(cli_args)
