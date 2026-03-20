@@ -7,6 +7,9 @@ pipeline:
     - tone
     - contrast
   stage_options:
+    colorizer:
+      color_boost: 1.0
+      ab_clip: 128.0
     depth:
       inference_size: 384
     bokeh:

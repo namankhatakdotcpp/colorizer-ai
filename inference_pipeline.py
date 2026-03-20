@@ -61,6 +61,7 @@ def load_pipeline_config(config_path: Path) -> Dict[str, Any]:
         "pipeline": {
             "stages": DEFAULT_PIPELINE_STAGES,
             "stage_options": {
+                "colorizer": {"color_boost": 1.0, "ab_clip": 128.0},
                 "depth": {"inference_size": 384},
                 "bokeh": {"focus_threshold": 0.2},
             },
@@ -145,9 +146,13 @@ class ColorizerStage(PipelineStage):
         if self.model is None:
             return x
 
-        l_np = kwargs.get("context", {}).get("l_np")
+        context = kwargs.get("context", {})
+        l_np = context.get("l_np")
         if l_np is None:
             raise RuntimeError("ColorizerStage requires context['l_np'] for LAB reconstruction.")
+
+        color_boost = float(context.get("color_boost", self.options.get("color_boost", 1.0)))
+        ab_clip = float(self.options.get("ab_clip", 128.0))
 
         with torch.inference_mode():
             with _autocast_context(self.device, self.amp_enabled):
@@ -155,7 +160,11 @@ class ColorizerStage(PipelineStage):
 
         lab = np.zeros((l_np.shape[0], l_np.shape[1], 3), dtype=np.float32)
         lab[:, :, 0] = l_np * 100.0
-        lab[:, :, 1:] = np.clip(ab_pred, -1.0, 1.0) * 128.0
+
+        ab = np.clip(ab_pred, -1.0, 1.0) * 128.0
+        if color_boost != 1.0:
+            ab = ab * color_boost
+        lab[:, :, 1:] = np.clip(ab, -ab_clip, ab_clip)
         rgb = np.clip(lab2rgb(lab), 0.0, 1.0)
 
         rgb_tensor = torch.from_numpy(rgb).permute(2, 0, 1).unsqueeze(0).float().to(self.device)
@@ -326,8 +335,10 @@ class ModularInferencePipeline:
         rgb_tensor = torch.from_numpy(rgb_np).permute(2, 0, 1).unsqueeze(0).float().to(self.device)
         return rgb_tensor, context
 
-    def process_image(self, image: Image.Image) -> np.ndarray:
+    def process_image(self, image: Image.Image, context_overrides: Optional[Dict[str, Any]] = None) -> np.ndarray:
         x, context = self._prepare_input(image)
+        if context_overrides:
+            context.update(context_overrides)
 
         for stage in self.stages:
             stage.load()
@@ -384,6 +395,7 @@ def run(
     apply_histogram_normalization: bool = True,
     pipeline_config: Path = Path("configs/pipeline.yaml"),
     stage_override: Optional[Iterable[str]] = None,
+    color_boost: float = 1.0,
 ) -> Path:
     output_dir.mkdir(parents=True, exist_ok=True)
     if not input_image.exists():
@@ -402,7 +414,7 @@ def run(
     )
 
     image = Image.open(input_image)
-    rgb = pipeline.process_image(image)
+    rgb = pipeline.process_image(image, context_overrides={"color_boost": color_boost})
 
     if apply_temperature_correction:
         rgb = apply_lab_temperature_correction(rgb, delta_a=temperature_delta_a, delta_b=temperature_delta_b)
@@ -427,6 +439,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--full-pipeline", action="store_true", help="Run all configured pipeline stages")
     parser.add_argument("--pipeline-config", type=Path, default=Path("configs/pipeline.yaml"))
     parser.add_argument("--stages", nargs="+", default=None, help="Optional explicit stage order override")
+    parser.add_argument("--color-boost", type=float, default=1.0, help="Stage1 AB chroma boost factor.")
 
     parser.set_defaults(lab_temp_correction=True)
     parser.add_argument("--lab-temp-correction", dest="lab_temp_correction", action="store_true")
@@ -453,6 +466,7 @@ def main() -> None:
         apply_histogram_normalization=args.hist_norm,
         pipeline_config=args.pipeline_config,
         stage_override=args.stages,
+        color_boost=args.color_boost,
     )
 
 

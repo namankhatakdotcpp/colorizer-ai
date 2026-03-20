@@ -129,14 +129,19 @@ class ColorizationDataset(Dataset):
         if ab_arr.ndim != 3 or ab_arr.shape[2] != 2:
             raise ValueError(f"Expected AB shape (H, W, 2), got {ab_arr.shape} at {ab_path}")
 
-        l = torch.from_numpy(l_arr).unsqueeze(0).float() / 100.0
-        ab = torch.from_numpy(ab_arr).permute(2, 0, 1).float() / 128.0
+        # Enforce stable LAB normalization bounds.
+        l = torch.from_numpy(l_arr).unsqueeze(0).float().clamp(0.0, 100.0) / 100.0
+        ab = torch.from_numpy(ab_arr).permute(2, 0, 1).float().clamp(-128.0, 128.0) / 128.0
 
         if self.augment:
             # Random horizontal flip.
             if torch.rand(1).item() > 0.5:
                 l = torch.flip(l, dims=[2])
                 ab = torch.flip(ab, dims=[2])
+            # Random vertical flip.
+            if torch.rand(1).item() > 0.5:
+                l = torch.flip(l, dims=[1])
+                ab = torch.flip(ab, dims=[1])
 
             # Random crop + resize back to target resolution (safe for fixed-shape pipelines).
             h, w = l.shape[-2], l.shape[-1]
@@ -166,7 +171,15 @@ class ColorizationDataset(Dataset):
             noise = torch.randn_like(l) * 0.01
             l = torch.clamp(l + noise, 0.0, 1.0)
 
-        return l, ab
+            # Chroma-strength augmentation to reduce grayscale collapse tendency.
+            chroma_scale = random.uniform(0.85, 1.20)
+            ab = torch.clamp(ab * chroma_scale, -1.0, 1.0)
+
+            # Small AB jitter improves robustness to slight color shifts.
+            ab_jitter = (torch.rand_like(ab) - 0.5) * 0.04
+            ab = torch.clamp(ab + ab_jitter, -1.0, 1.0)
+
+        return l.clamp(0.0, 1.0), ab.clamp(-1.0, 1.0)
 
 
 class ImageColorizationDataset(Dataset):
@@ -276,15 +289,17 @@ class ImageColorizationDataset(Dataset):
         rgb_np = np.asarray(rgb, dtype=np.float32) / 255.0
         lab = rgb2lab(rgb_np).astype(np.float32)
 
-        l = torch.from_numpy(lab[:, :, 0]).unsqueeze(0) / 100.0
-        ab = torch.from_numpy(lab[:, :, 1:]).permute(2, 0, 1) / 128.0
+        l = torch.from_numpy(lab[:, :, 0]).unsqueeze(0).clamp(0.0, 100.0) / 100.0
+        ab = torch.from_numpy(lab[:, :, 1:]).permute(2, 0, 1).clamp(-128.0, 128.0) / 128.0
 
         if self.augment:
             # Random Gaussian noise on luminance for robustness.
             noise = torch.randn_like(l) * 0.01
             l = torch.clamp(l + noise, 0.0, 1.0)
+            chroma_scale = random.uniform(0.85, 1.20)
+            ab = torch.clamp(ab * chroma_scale, -1.0, 1.0)
 
-        return l, ab
+        return l.clamp(0.0, 1.0), ab.clamp(-1.0, 1.0)
 
 
 def build_combined_colorization_dataset(

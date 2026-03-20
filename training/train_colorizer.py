@@ -65,16 +65,48 @@ class VGGPerceptualLoss(torch.nn.Module):
         return (x - self.mean) / self.std
 
     @staticmethod
-    def _lab_proxy_rgb(l_channel: torch.Tensor, ab_channel: torch.Tensor) -> torch.Tensor:
-        # Fast proxy to map LAB tensors into 3 channels for VGG feature comparison.
-        return torch.cat([l_channel, (ab_channel + 1.0) * 0.5], dim=1).clamp(0.0, 1.0)
+    def _lab_to_rgb(l_channel: torch.Tensor, ab_channel: torch.Tensor) -> torch.Tensor:
+        """
+        Differentiable LAB->RGB conversion.
+        l_channel: [0, 1], ab_channel: [-1, 1]
+        """
+        l_real = torch.clamp(l_channel, 0.0, 1.0) * 100.0
+        ab_real = torch.clamp(ab_channel, -1.0, 1.0) * 128.0
+
+        a = ab_real[:, 0:1, :, :]
+        b = ab_real[:, 1:2, :, :]
+
+        y = (l_real + 16.0) / 116.0
+        x = (a / 500.0) + y
+        z = y - (b / 200.0)
+        xyz = torch.cat([x, y, z], dim=1)
+
+        mask = xyz > 0.2068966
+        xyz_cubic = torch.pow(torch.clamp(xyz, min=1e-6), 3.0)
+        xyz_linear = (xyz - 16.0 / 116.0) / 7.787
+        xyz = torch.where(mask, xyz_cubic, xyz_linear)
+
+        xyz_x = xyz[:, 0:1, :, :] * 0.95047
+        xyz_y = xyz[:, 1:2, :, :] * 1.00000
+        xyz_z = xyz[:, 2:3, :, :] * 1.08883
+
+        r = xyz_x * 3.2406 + xyz_y * -1.5372 + xyz_z * -0.4986
+        g = xyz_x * -0.9689 + xyz_y * 1.8758 + xyz_z * 0.0415
+        b_rgb = xyz_x * 0.0557 + xyz_y * -0.2040 + xyz_z * 1.0570
+        rgb = torch.cat([r, g, b_rgb], dim=1)
+
+        mask_rgb = rgb > 0.0031308
+        rgb_gamma = 1.055 * torch.pow(torch.clamp(rgb, min=1e-8), 1.0 / 2.4) - 0.055
+        rgb_linear = rgb * 12.92
+        rgb = torch.where(mask_rgb, rgb_gamma, rgb_linear)
+        return torch.clamp(rgb, 0.0, 1.0)
 
     def forward(self, pred_ab: torch.Tensor, target_ab: torch.Tensor, l_channel: torch.Tensor) -> torch.Tensor:
         if not self.enabled:
             return pred_ab.new_tensor(0.0)
 
-        pred_rgb = self._lab_proxy_rgb(l_channel, pred_ab)
-        target_rgb = self._lab_proxy_rgb(l_channel, target_ab)
+        pred_rgb = self._lab_to_rgb(l_channel, pred_ab)
+        target_rgb = self._lab_to_rgb(l_channel, target_ab)
 
         pred_feat = self.features(self._normalize(pred_rgb))
         with torch.no_grad():
@@ -96,11 +128,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--perf-log-interval", type=int, default=50)
     parser.add_argument("--image-size", type=int, default=256)
     parser.add_argument("--perceptual-weight", type=float, default=0.1)
-    parser.add_argument("--colorfulness-weight", type=float, default=0.05)
+    parser.add_argument("--colorfulness-weight", type=float, default=0.12)
+    parser.add_argument("--chroma-target-ratio", type=float, default=0.85)
     parser.add_argument("--accum-steps", type=int, default=1)
+    parser.add_argument("--optimizer", type=str, default="adamw", choices=["adam", "adamw", "sgd"])
+    parser.add_argument("--weight-decay", type=float, default=1e-4)
+    parser.add_argument("--gradient-clip", type=float, default=1.0)
     parser.add_argument("--ddp-bucket-cap-mb", type=int, default=75)
     parser.add_argument("--disable-perceptual-loss", action="store_true")
-    parser.add_argument("--resume", type=str, default=None, help="Resume from a specific checkpoint path.")
+    parser.add_argument("--resume", type=str, default="auto", help="Resume from a specific checkpoint path or 'auto'.")
+    parser.add_argument("--finetune-epochs", type=int, default=0, help="If >0 and resuming, run only this many extra epochs.")
     parser.add_argument("--auto-optimize", action="store_true", help="Enable performance-oriented runtime hints.")
     parser.add_argument("--debug-grad", action="store_true", help="Enable periodic grad norm logging.")
     parser.add_argument("--compile", action="store_true", help="Compile model with torch.compile.")
@@ -137,7 +174,10 @@ def load_checkpoint(path: Path, model: torch.nn.Module, optimizer: torch.optim.O
         model.module.load_state_dict(state_dict)
     else:
         model.load_state_dict(state_dict)
-    optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+    try:
+        optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+    except Exception as exc:
+        print(f"[WARN] Optimizer state could not be restored from {path}: {exc}. Continuing with fresh optimizer.")
     start_epoch = int(checkpoint["epoch"]) + 1
     best_metric = float(checkpoint.get("best_metric", float("inf")))
     return start_epoch, best_metric
@@ -168,6 +208,14 @@ def _move_optimizer_state_to_device(optimizer: torch.optim.Optimizer, device: to
         for key, value in state.items():
             if torch.is_tensor(value):
                 state[key] = value.to(device, non_blocking=True)
+
+
+def build_optimizer(args: argparse.Namespace, params):
+    if args.optimizer == "adam":
+        return optim.Adam(params, lr=args.lr, weight_decay=args.weight_decay)
+    if args.optimizer == "sgd":
+        return optim.SGD(params, lr=args.lr, momentum=0.9, weight_decay=args.weight_decay)
+    return optim.AdamW(params, lr=args.lr, weight_decay=args.weight_decay, betas=(0.9, 0.99))
 
 
 def load_checkpoint_for_resume(
@@ -617,7 +665,16 @@ def main(args: argparse.Namespace | None = None) -> None:
             print(f"First batch shape: {first_batch_shape}")
 
         # === RESUME SYSTEM START ===
-        resume_path = Path(args.resume) if args.resume is not None else None
+        resume_path = None
+        if args.resume and args.resume.strip() and args.resume.lower() != "none":
+            if args.resume.lower() == "auto":
+                auto_candidates = [
+                    Path(args.checkpoint_dir) / f"{args.run_name}_latest.pth",
+                    Path(args.checkpoint_dir) / f"{args.run_name}_best.pth",
+                ]
+                resume_path = next((p for p in auto_candidates if p.exists()), None)
+            else:
+                resume_path = Path(args.resume)
         # === RESUME SYSTEM END ===
         ddp_bucket_cap_mb = max(50, min(int(args.ddp_bucket_cap_mb), 100))
         compile_enabled = False
@@ -631,7 +688,7 @@ def main(args: argparse.Namespace | None = None) -> None:
 
         if resume_path is not None:
             model = UNetColorizer(in_channels=1, out_channels=2)
-            optimizer = optim.SGD(model.parameters(), lr=args.lr, momentum=0.0, weight_decay=1e-5)
+            optimizer = build_optimizer(args, model.parameters())
             start_epoch, best_loss = load_checkpoint_for_resume(resume_path, model, optimizer, rank)
             if rank == 0:
                 print(f"Loaded checkpoint: {resume_path}")
@@ -664,7 +721,7 @@ def main(args: argparse.Namespace | None = None) -> None:
                     bucket_cap_mb=ddp_bucket_cap_mb,
                     find_unused_parameters=False,
                 )
-            optimizer = optim.SGD(model.parameters(), lr=args.lr, momentum=0.0, weight_decay=1e-5)
+            optimizer = build_optimizer(args, model.parameters())
 
         total_params = sum(p.numel() for p in model.parameters())
         if total_params < 1_000_000:
@@ -721,6 +778,11 @@ def main(args: argparse.Namespace | None = None) -> None:
                 print(f"Resuming from {latest_path}")
             start_epoch, best_loss = load_checkpoint(latest_path, model, optimizer, device)
 
+        if args.finetune_epochs > 0 and start_epoch > 0:
+            args.epochs = min(args.epochs, start_epoch + args.finetune_epochs)
+            if rank == 0:
+                print(f"[INFO] Fine-tune window enabled: training until epoch {args.epochs}.")
+
         if ddp_enabled:
             dist.barrier()
 
@@ -762,10 +824,15 @@ def main(args: argparse.Namespace | None = None) -> None:
                 try:
                     with ddp_sync_context:
                         with autocast(enabled=True):
-                            ab_pred = model(l_channel)
+                            ab_pred = torch.clamp(model(l_channel), -1.0, 1.0)
                             l1_loss = criterion(ab_pred, ab_target)
                             p_loss = perceptual_loss_fn(ab_pred, ab_target, l_channel)
-                            colorfulness = torch.mean(torch.sqrt(ab_pred[:, 0] ** 2 + ab_pred[:, 1] ** 2 + 1e-8))
+
+                            pred_chroma = torch.sqrt(torch.clamp(ab_pred[:, 0] ** 2 + ab_pred[:, 1] ** 2, min=1e-8))
+                            target_chroma = torch.sqrt(torch.clamp(ab_target[:, 0] ** 2 + ab_target[:, 1] ** 2, min=1e-8))
+                            chroma_floor = torch.relu((target_chroma * args.chroma_target_ratio) - pred_chroma)
+                            colorfulness = chroma_floor.mean()
+
                             total_loss = (
                                 l1_loss + args.perceptual_weight * p_loss + args.colorfulness_weight * colorfulness
                             )
@@ -782,7 +849,7 @@ def main(args: argparse.Namespace | None = None) -> None:
 
                 if sync_gradients:
                     scaler.unscale_(optimizer)
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), args.gradient_clip)
 
                     if args.debug_grad and step % max(1, args.grad_log_interval) == 0:
                         grad_norm = compute_grad_norm(model)
@@ -851,7 +918,7 @@ def main(args: argparse.Namespace | None = None) -> None:
             if rank == 0:
                 print(
                     f"Epoch [{epoch + 1}/{args.epochs}] | Loss: {avg_loss:.6f} "
-                    f"(L1: {avg_l1_loss:.6f}, P: {avg_perceptual_loss:.6f}, C: {avg_colorfulness:.6f}) "
+                    f"(L1: {avg_l1_loss:.6f}, P: {avg_perceptual_loss:.6f}, Chroma: {avg_colorfulness:.6f}) "
                     f"| Steps: {steps_per_epoch} | Time: {epoch_time:.1f}s | "
                     f"AvgData: {1000.0 * avg_data_time:.1f}ms | AvgCompute: {1000.0 * avg_compute_time:.1f}ms"
                 )
