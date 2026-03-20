@@ -61,13 +61,15 @@ def main() -> None:
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
     # Verify checkpoints exist up front.
-    required = [args.checkpoints / "stage1_colorizer_best.pth"]
+    required = [args.checkpoints / "stage1_colorizer.pth"]
     if args.full_pipeline:
         required.extend(
             [
-                args.checkpoints / "stage2_sr_best.pth",
-                args.checkpoints / "stage3_depth_best.pth",
-                args.checkpoints / "stage4_contrast_best.pth",
+                args.checkpoints / "stage2_sr.pth",
+                args.checkpoints / "stage3_depth.pth",
+                args.checkpoints / "stage4_bokeh.pth",
+                args.checkpoints / "stage5_tone.pth",
+                args.checkpoints / "stage6_contrast.pth",
             ]
         )
     missing = [str(p) for p in required if not p.exists()]

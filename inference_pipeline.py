@@ -1,42 +1,43 @@
+from __future__ import annotations
+
 import argparse
+import contextlib
+import gc
 import time
 from pathlib import Path
-from typing import Dict
+from typing import Any, Dict, Iterable, List, Optional
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from PIL import Image
 from skimage.color import lab2rgb
+
 try:
     import cv2
-except Exception:
+except Exception:  # pragma: no cover
     cv2 = None
 
-from models.unet_colorizer import UNetColorizer
-from models.rrdb_sr import RRDBNet
+try:
+    import yaml
+except Exception as exc:  # pragma: no cover
+    raise RuntimeError("PyYAML is required for config-driven pipeline execution.") from exc
+
+from models.dfn_bokeh import DFNBokehModel
 from models.depth_model import DynamicFilterNetwork
 from models.micro_contrast_model import MicroContrastModel
+from models.rrdb_sr import RRDBNet
+from models.unet_colorizer import UNetColorizer
+from models.zero_dce import ZeroDCEModel
 
 
-def _ensure_finite_tensor(name: str, tensor: torch.Tensor) -> None:
-    if torch.isnan(tensor).any():
-        raise RuntimeError(f"NaN detected in inference pipeline ({name})")
-    if not torch.isfinite(tensor).all():
-        raise RuntimeError(f"NaN detected in pipeline ({name})")
+DEFAULT_PIPELINE_STAGES = ["colorizer", "sr", "depth", "bokeh", "tone", "contrast"]
 
 
-def _ensure_valid_rgb(name: str, rgb: np.ndarray) -> None:
-    if rgb.ndim != 3 or rgb.shape[2] != 3:
-        raise RuntimeError(f"Invalid RGB shape for {name}: {rgb.shape}")
-    if np.isnan(rgb).any():
-        raise RuntimeError(f"NaN detected in inference pipeline ({name})")
-    if not np.isfinite(rgb).all():
-        raise RuntimeError(f"NaN detected in pipeline ({name})")
-
-
-def _assert_uint8_range(name: str, img_u8: np.ndarray) -> None:
-    assert img_u8.min() >= 0, f"{name} min below 0"
-    assert img_u8.max() <= 255, f"{name} max above 255"
+def _autocast_context(device: torch.device, enabled: bool):
+    if enabled and device.type == "cuda":
+        return torch.cuda.amp.autocast(dtype=torch.float16)
+    return contextlib.nullcontext()
 
 
 def _strip_module_prefix(state_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
@@ -45,86 +46,320 @@ def _strip_module_prefix(state_dict: Dict[str, torch.Tensor]) -> Dict[str, torch
     return {k.replace("module.", "", 1): v for k, v in state_dict.items()}
 
 
-def load_checkpoint(model: torch.nn.Module, path: Path, device: torch.device) -> bool:
-    if not path.exists():
-        print(f"[WARN] Missing checkpoint: {path}")
+def _load_checkpoint(model: torch.nn.Module, checkpoint_path: Path, device: torch.device) -> bool:
+    if not checkpoint_path.exists():
         return False
-
-    checkpoint = torch.load(path, map_location=device)
+    checkpoint = torch.load(checkpoint_path, map_location=device)
     state_dict = checkpoint.get("model_state_dict", checkpoint)
-    state_dict = _strip_module_prefix(state_dict)
-    model.load_state_dict(state_dict, strict=True)
+    model.load_state_dict(_strip_module_prefix(state_dict), strict=True)
     model.eval()
-    print(f"Loaded checkpoint: {path}")
     return True
 
 
-def stage1_colorize(gray_img: Image.Image, model: UNetColorizer, device: torch.device) -> np.ndarray:
-    # Resize to training resolution for consistent behavior.
-    gray = gray_img.resize((256, 256), Image.Resampling.BICUBIC)
-    l_np = np.asarray(gray, dtype=np.float32) / 255.0
-    if l_np.ndim != 2:
-        raise RuntimeError(f"Invalid grayscale input shape: {l_np.shape}")
-    if not np.isfinite(l_np).all():
-        raise RuntimeError("NaN detected in pipeline (input_luminance)")
+def load_pipeline_config(config_path: Path) -> Dict[str, Any]:
+    config = {
+        "pipeline": {
+            "stages": DEFAULT_PIPELINE_STAGES,
+            "stage_options": {
+                "depth": {"inference_size": 384},
+                "bokeh": {"focus_threshold": 0.2},
+            },
+        }
+    }
+    if not config_path.exists():
+        return config
 
-    l_tensor = torch.from_numpy(l_np).unsqueeze(0).unsqueeze(0).to(device)
-    _ensure_finite_tensor("stage1_input", l_tensor)
-    if float(l_tensor.min().item()) < -1e-6 or float(l_tensor.max().item()) > 1.0 + 1e-6:
-        raise RuntimeError("Stage1 input tensor out of expected [0,1] range.")
+    loaded = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+    pipeline = loaded.get("pipeline", {})
+    if isinstance(pipeline.get("stages"), list) and pipeline["stages"]:
+        config["pipeline"]["stages"] = [str(s).strip() for s in pipeline["stages"] if str(s).strip()]
+    if isinstance(pipeline.get("stage_options"), dict):
+        config["pipeline"]["stage_options"].update(pipeline["stage_options"])
+    return config
 
-    with torch.inference_mode():
-        ab_pred = model(l_tensor).squeeze(0).permute(1, 2, 0).cpu().numpy()
-    if not np.isfinite(ab_pred).all():
-        raise RuntimeError("NaN detected in pipeline (stage1_ab)")
 
-    # Undo normalization: L in [0,100], AB in [-128,128].
-    lab = np.zeros((l_np.shape[0], l_np.shape[1], 3), dtype=np.float32)
-    lab[:, :, 0] = l_np * 100.0
-    lab[:, :, 1:] = np.clip(ab_pred, -1.0, 1.0) * 128.0
+class PipelineStage:
+    stage_name: str = "base"
+    checkpoint_name: Optional[str] = None
+    required: bool = False
 
-    rgb = np.clip(lab2rgb(lab), 0.0, 1.0)
-    _ensure_valid_rgb("stage1_output", rgb)
-    return rgb
+    def __init__(
+        self,
+        device: torch.device,
+        checkpoints_dir: Path,
+        amp_enabled: bool,
+        options: Optional[Dict[str, Any]] = None,
+    ):
+        self.device = device
+        self.checkpoints_dir = checkpoints_dir
+        self.amp_enabled = amp_enabled
+        self.options = options or {}
+        self.model: Optional[torch.nn.Module] = None
+        self.loaded = False
+
+    def build_model(self) -> torch.nn.Module:
+        raise NotImplementedError
+
+    def load(self) -> None:
+        if self.loaded:
+            return
+        self.model = self.build_model().to(self.device)
+
+        if self.checkpoint_name:
+            ckpt_path = self.checkpoints_dir / self.checkpoint_name
+            loaded = _load_checkpoint(self.model, ckpt_path, self.device)
+            if not loaded and self.required:
+                raise FileNotFoundError(f"Missing required checkpoint: {ckpt_path}")
+            if not loaded:
+                # Optional stage with missing checkpoint: stage will behave like identity.
+                self.model = None
+                self.loaded = True
+                return
+        else:
+            self.model.eval()
+
+        self.loaded = True
+
+    def run(self, x: torch.Tensor, **kwargs) -> torch.Tensor:
+        raise NotImplementedError
+
+    def unload(self) -> None:
+        if self.model is not None:
+            del self.model
+            self.model = None
+        self.loaded = False
+        if self.device.type == "cuda":
+            torch.cuda.empty_cache()
+        gc.collect()
+
+
+class ColorizerStage(PipelineStage):
+    stage_name = "colorizer"
+    checkpoint_name = "stage1_colorizer.pth"
+    required = True
+
+    def build_model(self) -> torch.nn.Module:
+        return UNetColorizer(in_channels=1, out_channels=2)
+
+    def run(self, x: torch.Tensor, **kwargs) -> torch.Tensor:
+        if self.model is None:
+            return x
+
+        l_np = kwargs.get("context", {}).get("l_np")
+        if l_np is None:
+            raise RuntimeError("ColorizerStage requires context['l_np'] for LAB reconstruction.")
+
+        with torch.inference_mode():
+            with _autocast_context(self.device, self.amp_enabled):
+                ab_pred = self.model(x).squeeze(0).permute(1, 2, 0).float().cpu().numpy()
+
+        lab = np.zeros((l_np.shape[0], l_np.shape[1], 3), dtype=np.float32)
+        lab[:, :, 0] = l_np * 100.0
+        lab[:, :, 1:] = np.clip(ab_pred, -1.0, 1.0) * 128.0
+        rgb = np.clip(lab2rgb(lab), 0.0, 1.0)
+
+        rgb_tensor = torch.from_numpy(rgb).permute(2, 0, 1).unsqueeze(0).float().to(self.device)
+        return rgb_tensor
+
+
+class SRStage(PipelineStage):
+    stage_name = "sr"
+    checkpoint_name = "stage2_sr.pth"
+
+    def build_model(self) -> torch.nn.Module:
+        return RRDBNet()
+
+    def run(self, x: torch.Tensor, **kwargs) -> torch.Tensor:
+        if self.model is None:
+            return x
+        with torch.inference_mode():
+            with _autocast_context(self.device, self.amp_enabled):
+                out = self.model(x)
+        return torch.clamp(out, 0.0, 1.0)
+
+
+class DepthStage(PipelineStage):
+    stage_name = "depth"
+    checkpoint_name = "stage3_depth.pth"
+
+    def build_model(self) -> torch.nn.Module:
+        return DynamicFilterNetwork(in_channels=3)
+
+    def run(self, x: torch.Tensor, **kwargs) -> torch.Tensor:
+        context = kwargs.get("context", {})
+        inference_size = int(self.options.get("inference_size", 384))
+
+        if self.model is None:
+            # Graceful fallback so downstream bokeh can still run.
+            context["depth"] = x.mean(dim=1, keepdim=True)
+            return x
+
+        h, w = x.shape[-2:]
+        depth_in = F.interpolate(x, size=(inference_size, inference_size), mode="bilinear", align_corners=False)
+
+        with torch.inference_mode():
+            with _autocast_context(self.device, self.amp_enabled):
+                depth_pred = self.model(depth_in)
+
+        depth_up = F.interpolate(depth_pred.float(), size=(h, w), mode="bilinear", align_corners=False)
+        context["depth"] = torch.clamp(depth_up, 0.0, 1.0)
+        return x
+
+
+class BokehStage(PipelineStage):
+    stage_name = "bokeh"
+    checkpoint_name = "stage4_bokeh.pth"
+
+    def build_model(self) -> torch.nn.Module:
+        kernel_size = int(self.options.get("kernel_size", 11))
+        return DFNBokehModel(kernel_size=kernel_size)
+
+    def run(self, x: torch.Tensor, **kwargs) -> torch.Tensor:
+        context = kwargs.get("context", {})
+        depth = context.get("depth")
+        if depth is None:
+            depth = x.mean(dim=1, keepdim=True)
+
+        if self.model is None:
+            return x
+
+        focus_threshold = float(self.options.get("focus_threshold", 0.2))
+        with torch.inference_mode():
+            with _autocast_context(self.device, self.amp_enabled):
+                out = self.model(x, depth, focus_threshold=focus_threshold)
+        return torch.clamp(out, 0.0, 1.0)
+
+
+class ToneStage(PipelineStage):
+    stage_name = "tone"
+    checkpoint_name = "stage5_tone.pth"
+
+    def build_model(self) -> torch.nn.Module:
+        iterations = int(self.options.get("iterations", 8))
+        channels = int(self.options.get("channels", 32))
+        return ZeroDCEModel(num_iterations=iterations, channels=channels)
+
+    def run(self, x: torch.Tensor, **kwargs) -> torch.Tensor:
+        if self.model is None:
+            return x
+
+        with torch.inference_mode():
+            with _autocast_context(self.device, self.amp_enabled):
+                enhanced, _ = self.model(x)
+        return torch.clamp(enhanced, 0.0, 1.0)
+
+
+class ContrastStage(PipelineStage):
+    stage_name = "contrast"
+    checkpoint_name = "stage6_contrast.pth"
+
+    def build_model(self) -> torch.nn.Module:
+        return MicroContrastModel(in_channels=3, out_channels=3)
+
+    def run(self, x: torch.Tensor, **kwargs) -> torch.Tensor:
+        if self.model is None:
+            return x
+        with torch.inference_mode():
+            with _autocast_context(self.device, self.amp_enabled):
+                out = self.model(x)
+        return torch.clamp(out, 0.0, 1.0)
+
+
+STAGE_REGISTRY = {
+    "colorizer": ColorizerStage,
+    "sr": SRStage,
+    "depth": DepthStage,
+    "bokeh": BokehStage,
+    "tone": ToneStage,
+    "contrast": ContrastStage,
+}
+
+
+class ModularInferencePipeline:
+    def __init__(
+        self,
+        checkpoints_dir: Path,
+        config_path: Path,
+        stage_override: Optional[Iterable[str]] = None,
+        device: Optional[torch.device] = None,
+        amp_enabled: bool = True,
+    ):
+        self.checkpoints_dir = checkpoints_dir
+        self.config_path = config_path
+        self.config = load_pipeline_config(config_path)
+
+        self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.amp_enabled = amp_enabled
+
+        configured_stages = self.config["pipeline"].get("stages", DEFAULT_PIPELINE_STAGES)
+        if stage_override is not None:
+            configured_stages = [s.strip() for s in stage_override if s.strip()]
+        self.stage_names = configured_stages
+
+        stage_options = self.config["pipeline"].get("stage_options", {})
+        self.stages: List[PipelineStage] = []
+        for stage_name in self.stage_names:
+            if stage_name not in STAGE_REGISTRY:
+                raise ValueError(f"Unknown pipeline stage '{stage_name}'.")
+            stage_cls = STAGE_REGISTRY[stage_name]
+            self.stages.append(
+                stage_cls(
+                    device=self.device,
+                    checkpoints_dir=self.checkpoints_dir,
+                    amp_enabled=self.amp_enabled,
+                    options=stage_options.get(stage_name, {}),
+                )
+            )
+
+    def _prepare_input(self, image: Image.Image) -> tuple[torch.Tensor, Dict[str, Any]]:
+        context: Dict[str, Any] = {}
+
+        if self.stage_names and self.stage_names[0] == "colorizer":
+            gray = image.convert("L").resize((256, 256), Image.Resampling.BICUBIC)
+            l_np = np.asarray(gray, dtype=np.float32) / 255.0
+            l_tensor = torch.from_numpy(l_np).unsqueeze(0).unsqueeze(0).float().to(self.device)
+            context["l_np"] = l_np
+            return l_tensor, context
+
+        rgb = image.convert("RGB").resize((256, 256), Image.Resampling.BICUBIC)
+        rgb_np = np.asarray(rgb, dtype=np.float32) / 255.0
+        rgb_tensor = torch.from_numpy(rgb_np).permute(2, 0, 1).unsqueeze(0).float().to(self.device)
+        return rgb_tensor, context
+
+    def process_image(self, image: Image.Image) -> np.ndarray:
+        x, context = self._prepare_input(image)
+
+        for stage in self.stages:
+            stage.load()
+            x = stage.run(x, context=context)
+            stage.unload()
+
+        rgb = x.squeeze(0).permute(1, 2, 0).detach().cpu().numpy()
+        return np.clip(rgb, 0.0, 1.0)
 
 
 def apply_lab_temperature_correction(rgb: np.ndarray, delta_a: int = 6, delta_b: int = 6) -> np.ndarray:
     if cv2 is None:
-        print("[WARN] OpenCV unavailable; skipping LAB temperature correction.")
         return rgb
-    if rgb.ndim != 3 or rgb.shape[2] != 3:
-        print(f"[WARN] Unexpected image shape {rgb.shape}; skipping LAB temperature correction.")
-        return rgb
-
     try:
         rgb_u8 = np.clip(rgb * 255.0, 0.0, 255.0).astype(np.uint8)
-        _assert_uint8_range("temperature_rgb_u8", rgb_u8)
         bgr = cv2.cvtColor(rgb_u8, cv2.COLOR_RGB2BGR)
         lab = cv2.cvtColor(bgr, cv2.COLOR_BGR2LAB).astype(np.int16)
 
         lab[:, :, 1] = np.clip(lab[:, :, 1] + int(delta_a), 0, 255)
         lab[:, :, 2] = np.clip(lab[:, :, 2] + int(delta_b), 0, 255)
 
-        corrected_bgr = cv2.cvtColor(lab.astype(np.uint8), cv2.COLOR_LAB2BGR)
-        corrected_rgb = cv2.cvtColor(corrected_bgr, cv2.COLOR_BGR2RGB)
-        _assert_uint8_range("temperature_corrected_rgb_u8", corrected_rgb)
-        return corrected_rgb.astype(np.float32) / 255.0
-    except Exception as exc:
-        print(f"[WARN] LAB temperature correction failed, skipping: {exc}")
+        corrected = cv2.cvtColor(lab.astype(np.uint8), cv2.COLOR_LAB2RGB)
+        return corrected.astype(np.float32) / 255.0
+    except Exception:
         return rgb
 
 
 def apply_color_histogram_normalization(rgb: np.ndarray, clip_limit: float = 2.0) -> np.ndarray:
     if cv2 is None:
-        print("[WARN] OpenCV unavailable; skipping color histogram normalization.")
         return rgb
-    if rgb.ndim != 3 or rgb.shape[2] != 3:
-        print(f"[WARN] Unexpected image shape {rgb.shape}; skipping color histogram normalization.")
-        return rgb
-
     try:
         rgb_u8 = np.clip(rgb * 255.0, 0.0, 255.0).astype(np.uint8)
-        _assert_uint8_range("histnorm_rgb_u8", rgb_u8)
         bgr = cv2.cvtColor(rgb_u8, cv2.COLOR_RGB2BGR)
         lab = cv2.cvtColor(bgr, cv2.COLOR_BGR2LAB)
 
@@ -134,45 +369,8 @@ def apply_color_histogram_normalization(rgb: np.ndarray, clip_limit: float = 2.0
         out_bgr = cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
         out_rgb = cv2.cvtColor(out_bgr, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
         return np.clip(out_rgb, 0.0, 1.0)
-    except Exception as exc:
-        print(f"[WARN] Color histogram normalization failed, skipping: {exc}")
+    except Exception:
         return rgb
-
-
-def maybe_run_full_pipeline(rgb: np.ndarray, device: torch.device, checkpoints: Path) -> np.ndarray:
-    _ensure_valid_rgb("pipeline_input", rgb)
-    rgb_tensor = torch.from_numpy(rgb).permute(2, 0, 1).unsqueeze(0).float().to(device)
-    _ensure_finite_tensor("pipeline_input_tensor", rgb_tensor)
-
-    sr = RRDBNet().to(device)
-    depth = DynamicFilterNetwork(3).to(device)
-    contrast = MicroContrastModel(3, 3).to(device)
-
-    sr_loaded = load_checkpoint(sr, checkpoints / "stage2_sr_best.pth", device)
-    depth_loaded = load_checkpoint(depth, checkpoints / "stage3_depth_best.pth", device)
-    contrast_loaded = load_checkpoint(contrast, checkpoints / "stage4_contrast_best.pth", device)
-
-    with torch.inference_mode():
-        print("Stage2 start")
-        out = sr(rgb_tensor) if sr_loaded else rgb_tensor
-        _ensure_finite_tensor("stage2_output", out)
-        print("Stage2 finished")
-
-        print("Stage3 start")
-        if depth_loaded:
-            depth_out = depth(out)
-            _ensure_finite_tensor("stage3_output", depth_out)
-        print("Stage3 finished")
-
-        print("Stage4 start")
-        out = contrast(out) if contrast_loaded else out
-        _ensure_finite_tensor("stage4_output", out)
-        print("Stage4 finished")
-
-    out = out.squeeze(0).permute(1, 2, 0).detach().cpu().numpy()
-    out = np.clip(out, 0.0, 1.0)
-    _ensure_valid_rgb("pipeline_output", out)
-    return out
 
 
 def run(
@@ -184,6 +382,8 @@ def run(
     temperature_delta_a: int = 6,
     temperature_delta_b: int = 6,
     apply_histogram_normalization: bool = True,
+    pipeline_config: Path = Path("configs/pipeline.yaml"),
+    stage_override: Optional[Iterable[str]] = None,
 ) -> Path:
     output_dir.mkdir(parents=True, exist_ok=True)
     if not input_image.exists():
@@ -191,43 +391,29 @@ def run(
 
     start_time = time.perf_counter()
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Running inference on {device}")
-    if torch.cuda.is_available():
-        torch.backends.cudnn.benchmark = True
+    stages = list(stage_override) if stage_override is not None else None
+    if stages is None:
+        stages = None if run_full_pipeline else ["colorizer"]
 
-    colorizer = UNetColorizer(in_channels=1, out_channels=2).to(device)
-    stage1_best = checkpoints / "stage1_colorizer_best.pth"
-    stage1_latest = checkpoints / "stage1_colorizer_latest.pth"
-    if not load_checkpoint(colorizer, stage1_best, device):
-        if not load_checkpoint(colorizer, stage1_latest, device):
-            raise FileNotFoundError("Missing stage1 checkpoint (expected stage1_colorizer_best.pth or stage1_colorizer_latest.pth)")
+    pipeline = ModularInferencePipeline(
+        checkpoints_dir=checkpoints,
+        config_path=pipeline_config,
+        stage_override=stages,
+    )
 
-    print("Stage1 start")
-    gray = Image.open(input_image).convert("L")
-    rgb = stage1_colorize(gray, colorizer, device)
-    print("Stage1 finished")
+    image = Image.open(input_image)
+    rgb = pipeline.process_image(image)
 
     if apply_temperature_correction:
-        rgb = apply_lab_temperature_correction(
-            rgb,
-            delta_a=temperature_delta_a,
-            delta_b=temperature_delta_b,
-        )
-        _ensure_valid_rgb("temperature_corrected", rgb)
+        rgb = apply_lab_temperature_correction(rgb, delta_a=temperature_delta_a, delta_b=temperature_delta_b)
 
-    if run_full_pipeline:
-        rgb = maybe_run_full_pipeline(rgb, device, checkpoints)
-
-    if run_full_pipeline and apply_histogram_normalization:
+    if apply_histogram_normalization and run_full_pipeline:
         rgb = apply_color_histogram_normalization(rgb)
-        _ensure_valid_rgb("histogram_normalized", rgb)
 
-    stem = input_image.stem
-    out_path = output_dir / f"colorized_{stem}.jpg"
-    out_u8 = (rgb * 255.0).astype(np.uint8)
-    _assert_uint8_range("final_output_u8", out_u8)
+    out_path = output_dir / f"colorized_{input_image.stem}.jpg"
+    out_u8 = np.clip(rgb * 255.0, 0.0, 255.0).astype(np.uint8)
     Image.fromarray(out_u8).save(out_path, format="JPEG", quality=95)
+
     print(f"Saved output: {out_path}")
     print(f"Inference time: {time.perf_counter() - start_time:.3f}s")
     return out_path
@@ -238,29 +424,35 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("image", type=Path, help="Input grayscale image path")
     parser.add_argument("--output-dir", type=Path, default=Path("outputs"))
     parser.add_argument("--checkpoints", type=Path, default=Path("checkpoints"))
-    parser.add_argument("--full-pipeline", action="store_true", help="Run SR/depth/contrast stages if checkpoints are present")
+    parser.add_argument("--full-pipeline", action="store_true", help="Run all configured pipeline stages")
+    parser.add_argument("--pipeline-config", type=Path, default=Path("configs/pipeline.yaml"))
+    parser.add_argument("--stages", nargs="+", default=None, help="Optional explicit stage order override")
+
     parser.set_defaults(lab_temp_correction=True)
-    parser.add_argument("--lab-temp-correction", dest="lab_temp_correction", action="store_true", help="Enable LAB temperature correction after Stage1.")
-    parser.add_argument("--no-lab-temp-correction", dest="lab_temp_correction", action="store_false", help="Disable LAB temperature correction.")
-    parser.add_argument("--lab-temp-a", type=int, default=6, help="LAB channel A additive correction.")
-    parser.add_argument("--lab-temp-b", type=int, default=6, help="LAB channel B additive correction.")
+    parser.add_argument("--lab-temp-correction", dest="lab_temp_correction", action="store_true")
+    parser.add_argument("--no-lab-temp-correction", dest="lab_temp_correction", action="store_false")
+    parser.add_argument("--lab-temp-a", type=int, default=6)
+    parser.add_argument("--lab-temp-b", type=int, default=6)
+
     parser.set_defaults(hist_norm=True)
-    parser.add_argument("--hist-norm", dest="hist_norm", action="store_true", help="Enable post-pipeline LAB histogram normalization.")
-    parser.add_argument("--no-hist-norm", dest="hist_norm", action="store_false", help="Disable post-pipeline LAB histogram normalization.")
+    parser.add_argument("--hist-norm", dest="hist_norm", action="store_true")
+    parser.add_argument("--no-hist-norm", dest="hist_norm", action="store_false")
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
     run(
-        args.image,
-        args.output_dir,
-        args.checkpoints,
-        args.full_pipeline,
+        input_image=args.image,
+        output_dir=args.output_dir,
+        checkpoints=args.checkpoints,
+        run_full_pipeline=args.full_pipeline,
         apply_temperature_correction=args.lab_temp_correction,
         temperature_delta_a=args.lab_temp_a,
         temperature_delta_b=args.lab_temp_b,
         apply_histogram_normalization=args.hist_norm,
+        pipeline_config=args.pipeline_config,
+        stage_override=args.stages,
     )
 
 

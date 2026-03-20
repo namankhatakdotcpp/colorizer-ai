@@ -15,8 +15,11 @@ class Settings(BaseSettings):
     ALLOWED_MIME_TYPES: list[str] = ["image/jpeg", "image/png", "image/webp"]
     
     # Model Settings
-    MODEL_WEIGHTS_PATH: str = "checkpoints/stage1_colorizer_best.pth"
+    MODEL_WEIGHTS_PATH: str = "checkpoints/stage1_colorizer.pth"
     USE_HALF_PRECISION: bool = False
+    PIPELINE_CONFIG_PATH: str = "configs/pipeline.yaml"
+    PIPELINE_STAGES: str = ""
+    ENABLE_FULL_PIPELINE: bool = False
     
     # Admin Settings
     ADMIN_API_KEY: str = "hackathon-secret-key-123"

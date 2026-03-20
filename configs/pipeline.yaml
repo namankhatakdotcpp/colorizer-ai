@@ -1,0 +1,17 @@
+pipeline:
+  stages:
+    - colorizer
+    - sr
+    - depth
+    - bokeh
+    - tone
+    - contrast
+  stage_options:
+    depth:
+      inference_size: 384
+    bokeh:
+      kernel_size: 11
+      focus_threshold: 0.2
+    tone:
+      iterations: 8
+      channels: 32
