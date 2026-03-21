@@ -8,7 +8,7 @@ pipeline:
     - contrast
   stage_options:
     colorizer:
-      color_boost: 1.0
+      color_boost: 1.35
       ab_clip: 128.0
     depth:
       inference_size: 384

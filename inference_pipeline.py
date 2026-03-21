@@ -61,7 +61,7 @@ def load_pipeline_config(config_path: Path) -> Dict[str, Any]:
         "pipeline": {
             "stages": DEFAULT_PIPELINE_STAGES,
             "stage_options": {
-                "colorizer": {"color_boost": 1.0, "ab_clip": 128.0},
+                "colorizer": {"color_boost": 1.35, "ab_clip": 128.0},
                 "depth": {"inference_size": 384},
                 "bokeh": {"focus_threshold": 0.2},
             },
@@ -162,8 +162,13 @@ class ColorizerStage(PipelineStage):
         lab[:, :, 0] = l_np * 100.0
 
         ab = np.clip(ab_pred, -1.0, 1.0) * 128.0
-        if color_boost != 1.0:
-            ab = ab * color_boost
+        mean_chroma = float(np.sqrt(np.mean(ab[:, :, 0] ** 2 + ab[:, :, 1] ** 2)))
+        adaptive_boost = color_boost
+        if mean_chroma < 15.0:
+            adaptive_boost = color_boost * 1.8
+        elif mean_chroma < 25.0:
+            adaptive_boost = color_boost * 1.3
+        ab = ab * adaptive_boost
         lab[:, :, 1:] = np.clip(ab, -ab_clip, ab_clip)
         rgb = np.clip(lab2rgb(lab), 0.0, 1.0)
 
@@ -384,6 +389,43 @@ def apply_color_histogram_normalization(rgb: np.ndarray, clip_limit: float = 2.0
         return rgb
 
 
+def compute_colorization_quality_score(rgb: np.ndarray) -> Dict[str, Any]:
+    """
+    Compute coarse automatic quality diagnostics for a colorized RGB image.
+    """
+    try:
+        from skimage.color import rgb2lab
+    except Exception:
+        return {
+            "mean_chroma": 0.0,
+            "max_chroma": 0.0,
+            "vivid_pixel_pct": 0.0,
+            "colorfulness_score": 0.0,
+            "quality_grade": "Unavailable",
+        }
+
+    lab = rgb2lab(np.clip(rgb, 0.0, 1.0))
+    a_ch = lab[:, :, 1]
+    b_ch = lab[:, :, 2]
+    chroma = np.sqrt(a_ch ** 2 + b_ch ** 2)
+    mean_chroma = float(chroma.mean())
+    return {
+        "mean_chroma": mean_chroma,
+        "max_chroma": float(chroma.max()),
+        "vivid_pixel_pct": float((chroma > 15.0).mean() * 100.0),
+        "colorfulness_score": float(np.std(a_ch) + np.std(b_ch)),
+        "quality_grade": (
+            "Excellent"
+            if mean_chroma > 25.0
+            else "Good"
+            if mean_chroma > 15.0
+            else "Fair"
+            if mean_chroma > 8.0
+            else "Poor"
+        ),
+    }
+
+
 def run(
     input_image: Path,
     output_dir: Path,
@@ -395,7 +437,7 @@ def run(
     apply_histogram_normalization: bool = True,
     pipeline_config: Path = Path("configs/pipeline.yaml"),
     stage_override: Optional[Iterable[str]] = None,
-    color_boost: float = 1.0,
+    color_boost: float = 1.35,
 ) -> Path:
     output_dir.mkdir(parents=True, exist_ok=True)
     if not input_image.exists():
@@ -425,8 +467,14 @@ def run(
     out_path = output_dir / f"colorized_{input_image.stem}.jpg"
     out_u8 = np.clip(rgb * 255.0, 0.0, 255.0).astype(np.uint8)
     Image.fromarray(out_u8).save(out_path, format="JPEG", quality=95)
+    quality = compute_colorization_quality_score(rgb)
 
     print(f"Saved output: {out_path}")
+    print("Colorization quality report:")
+    print(f"  Grade: {quality['quality_grade']}")
+    print(f"  Mean Chroma: {quality['mean_chroma']:.1f}")
+    print(f"  Vivid Pixels: {quality['vivid_pixel_pct']:.1f}%")
+    print(f"  Colorfulness: {quality['colorfulness_score']:.1f}")
     print(f"Inference time: {time.perf_counter() - start_time:.3f}s")
     return out_path
 
@@ -439,7 +487,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--full-pipeline", action="store_true", help="Run all configured pipeline stages")
     parser.add_argument("--pipeline-config", type=Path, default=Path("configs/pipeline.yaml"))
     parser.add_argument("--stages", nargs="+", default=None, help="Optional explicit stage order override")
-    parser.add_argument("--color-boost", type=float, default=1.0, help="Stage1 AB chroma boost factor.")
+    parser.add_argument("--color-boost", type=float, default=1.35, help="Stage1 AB chroma boost factor.")
 
     parser.set_defaults(lab_temp_correction=True)
     parser.add_argument("--lab-temp-correction", dest="lab_temp_correction", action="store_true")

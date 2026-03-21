@@ -1,6 +1,7 @@
 import argparse
 import contextlib
 import hashlib
+import math
 import os
 import shutil
 import socket
@@ -22,6 +23,7 @@ from typing import Iterable, List
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
+import torch.nn as nn
 import torch.optim as optim
 from torch.cuda.amp import GradScaler, autocast
 from torch.distributed.elastic.multiprocessing.errors import record
@@ -31,6 +33,7 @@ from torch.utils.data.distributed import DistributedSampler
 from torchvision.models import VGG16_Weights, vgg16
 
 from datasets.dataset_colorizer import build_combined_colorization_dataset
+from models.patch_discriminator import PatchDiscriminator
 from models.unet_colorizer import UNetColorizer
 
 
@@ -49,7 +52,8 @@ class VGGPerceptualLoss(torch.nn.Module):
         self.enabled = True
         try:
             backbone = vgg16(weights=VGG16_Weights.IMAGENET1K_V1)
-            self.features = backbone.features[:16].eval()
+            # relu3_3 captures richer color/semantic regions than shallow relu2_2.
+            self.features = backbone.features[:23].eval()
             for param in self.features.parameters():
                 param.requires_grad = False
         except Exception as exc:
@@ -127,9 +131,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--grad-log-interval", type=int, default=100)
     parser.add_argument("--perf-log-interval", type=int, default=50)
     parser.add_argument("--image-size", type=int, default=256)
-    parser.add_argument("--perceptual-weight", type=float, default=0.1)
-    parser.add_argument("--colorfulness-weight", type=float, default=0.12)
+    parser.add_argument("--perceptual-weight", type=float, default=0.5)
+    parser.add_argument("--colorfulness-weight", type=float, default=1.0)
     parser.add_argument("--chroma-target-ratio", type=float, default=0.85)
+    parser.add_argument("--gan-start-epoch", type=int, default=30)
+    parser.add_argument("--gan-weight", type=float, default=0.1)
     parser.add_argument("--accum-steps", type=int, default=1)
     parser.add_argument("--optimizer", type=str, default="adamw", choices=["adam", "adamw", "sgd"])
     parser.add_argument("--weight-decay", type=float, default=1e-4)
@@ -758,6 +764,22 @@ def main(args: argparse.Namespace | None = None) -> None:
             perceptual_loss_fn.enabled = False
         if rank == 0 and not perceptual_loss_fn.enabled:
             print("[WARN] Perceptual loss disabled.")
+        if rank == 0:
+            print(f"Loss weights: L1=0.05, P={args.perceptual_weight}, C={args.colorfulness_weight}")
+
+        # PatchGAN discriminator for adversarial color realism (activates after warmup epochs).
+        disc = PatchDiscriminator(in_channels=3).to(device)
+        if ddp_enabled:
+            disc = DDP(
+                disc,
+                device_ids=[local_rank],
+                broadcast_buffers=False,
+                gradient_as_bucket_view=True,
+                bucket_cap_mb=ddp_bucket_cap_mb,
+                find_unused_parameters=False,
+            )
+        disc_optimizer = optim.AdamW(disc.parameters(), lr=args.lr * 0.5, weight_decay=args.weight_decay)
+        gan_criterion = nn.BCEWithLogitsLoss().to(device)
 
         scaler = GradScaler(enabled=True)
         accum_steps = max(1, int(args.accum_steps))
@@ -805,6 +827,17 @@ def main(args: argparse.Namespace | None = None) -> None:
             if rank == 0:
                 print(f"[INFO] Fine-tune window enabled: training until epoch {args.epochs}.")
 
+        warmup_epochs = 5
+        total_epochs = max(int(args.epochs), 1)
+
+        def lr_lambda(current_epoch: int) -> float:
+            if current_epoch < warmup_epochs:
+                return float(current_epoch + 1) / float(warmup_epochs)
+            progress = (current_epoch - warmup_epochs) / max(total_epochs - warmup_epochs, 1)
+            return 0.5 * (1.0 + math.cos(math.pi * progress))
+
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
+
         if ddp_enabled:
             dist.barrier()
 
@@ -819,12 +852,15 @@ def main(args: argparse.Namespace | None = None) -> None:
             if sampler is not None:
                 sampler.set_epoch(epoch)
             model.train()
+            disc.train()
             torch.cuda.reset_peak_memory_stats(device)
 
             running_loss = 0.0
             running_l1_loss = 0.0
             running_perceptual_loss = 0.0
             running_colorfulness = 0.0
+            running_gan_loss = 0.0
+            running_disc_loss = 0.0
             running_data_time = 0.0
             running_compute_time = 0.0
             zero_grad_counter = 0
@@ -852,16 +888,53 @@ def main(args: argparse.Namespace | None = None) -> None:
 
                             pred_chroma = torch.sqrt(torch.clamp(ab_pred[:, 0] ** 2 + ab_pred[:, 1] ** 2, min=1e-8))
                             target_chroma = torch.sqrt(torch.clamp(ab_target[:, 0] ** 2 + ab_target[:, 1] ** 2, min=1e-8))
-                            chroma_floor = torch.relu((target_chroma * args.chroma_target_ratio) - pred_chroma)
-                            colorfulness = chroma_floor.mean()
+                            chroma_ratio = pred_chroma / (target_chroma + 1e-6)
+                            ratio_penalty = torch.relu(args.chroma_target_ratio - chroma_ratio).mean()
+                            chroma_mse = F.mse_loss(pred_chroma, target_chroma)
+                            pred_norm_a = ab_pred[:, 0] / (pred_chroma + 1e-6)
+                            pred_norm_b = ab_pred[:, 1] / (pred_chroma + 1e-6)
+                            tgt_norm_a = ab_target[:, 0] / (target_chroma + 1e-6)
+                            tgt_norm_b = ab_target[:, 1] / (target_chroma + 1e-6)
+                            hue_loss = (1.0 - (pred_norm_a * tgt_norm_a + pred_norm_b * tgt_norm_b)).clamp(min=0).mean()
+                            colorfulness = ratio_penalty + 0.5 * chroma_mse + 0.3 * hue_loss
 
                             total_loss = (
-                                l1_loss + args.perceptual_weight * p_loss + args.colorfulness_weight * colorfulness
+                                0.05 * l1_loss + args.perceptual_weight * p_loss + args.colorfulness_weight * colorfulness
                             )
+
+                            g_adv = l1_loss.new_tensor(0.0)
+                            if epoch >= int(args.gan_start_epoch):
+                                for param in disc.parameters():
+                                    param.requires_grad_(False)
+                                fake_rgb_gen = perceptual_loss_fn._lab_to_rgb(l_channel, ab_pred)
+                                gen_logits = disc(fake_rgb_gen)
+                                g_adv = gan_criterion(gen_logits, torch.ones_like(gen_logits))
+                                for param in disc.parameters():
+                                    param.requires_grad_(True)
+                                total_loss = total_loss + float(args.gan_weight) * g_adv
+
                             loss = total_loss / accumulation_divisor
-                        if not torch.isfinite(total_loss):
-                            raise RuntimeError("Non-finite loss detected")
-                        scaler.scale(loss).backward()
+
+                    d_loss = l1_loss.new_tensor(0.0)
+                    if epoch >= int(args.gan_start_epoch) and sync_gradients:
+                        with torch.no_grad():
+                            fake_rgb = perceptual_loss_fn._lab_to_rgb(l_channel, ab_pred.detach()).float()
+                            real_rgb = perceptual_loss_fn._lab_to_rgb(l_channel, ab_target).float()
+
+                        disc_optimizer.zero_grad(set_to_none=True)
+                        real_logits = disc(real_rgb)
+                        fake_logits = disc(fake_rgb)
+                        d_loss = (
+                            gan_criterion(real_logits, torch.ones_like(real_logits))
+                            + gan_criterion(fake_logits, torch.zeros_like(fake_logits))
+                        ) * 0.5
+                        d_loss.backward()
+                        torch.nn.utils.clip_grad_norm_(disc.parameters(), args.gradient_clip)
+                        disc_optimizer.step()
+
+                    if not torch.isfinite(total_loss):
+                        raise RuntimeError("Non-finite loss detected")
+                    scaler.scale(loss).backward()
                 except Exception:
                     _log_exception(rank, f"forward/backward failed at epoch={epoch + 1}, step={step}")
                     raise
@@ -894,6 +967,8 @@ def main(args: argparse.Namespace | None = None) -> None:
                 running_l1_loss += float(l1_loss.item())
                 running_perceptual_loss += float(p_loss.item())
                 running_colorfulness += float(colorfulness.item())
+                running_gan_loss += float(g_adv.item())
+                running_disc_loss += float(d_loss.item())
                 if rank == 0 and step % max(1, args.perf_log_interval) == 0:
                     max_mem_gb = torch.cuda.max_memory_allocated(device) / (1024 ** 3)
                     bottleneck = "data" if running_data_time > running_compute_time else "compute"
@@ -913,6 +988,8 @@ def main(args: argparse.Namespace | None = None) -> None:
                         running_l1_loss,
                         running_perceptual_loss,
                         running_colorfulness,
+                        running_gan_loss,
+                        running_disc_loss,
                         running_data_time,
                         running_compute_time,
                     ],
@@ -924,14 +1001,18 @@ def main(args: argparse.Namespace | None = None) -> None:
                 avg_l1_loss = float(stats[1].item()) / denom
                 avg_perceptual_loss = float(stats[2].item()) / denom
                 avg_colorfulness = float(stats[3].item()) / denom
-                avg_data_time = float(stats[4].item()) / denom
-                avg_compute_time = float(stats[5].item()) / denom
+                avg_gan_loss = float(stats[4].item()) / denom
+                avg_disc_loss = float(stats[5].item()) / denom
+                avg_data_time = float(stats[6].item()) / denom
+                avg_compute_time = float(stats[7].item()) / denom
             else:
                 denom = max(steps_per_epoch, 1)
                 avg_loss = running_loss / denom
                 avg_l1_loss = running_l1_loss / denom
                 avg_perceptual_loss = running_perceptual_loss / denom
                 avg_colorfulness = running_colorfulness / denom
+                avg_gan_loss = running_gan_loss / denom
+                avg_disc_loss = running_disc_loss / denom
                 avg_data_time = running_data_time / denom
                 avg_compute_time = running_compute_time / denom
 
@@ -940,7 +1021,8 @@ def main(args: argparse.Namespace | None = None) -> None:
             if rank == 0:
                 print(
                     f"Epoch [{epoch + 1}/{args.epochs}] | Loss: {avg_loss:.6f} "
-                    f"(L1: {avg_l1_loss:.6f}, P: {avg_perceptual_loss:.6f}, Chroma: {avg_colorfulness:.6f}) "
+                    f"(L1: {avg_l1_loss:.6f}, P: {avg_perceptual_loss:.6f}, Chroma: {avg_colorfulness:.6f}, "
+                    f"GAdv: {avg_gan_loss:.6f}, D: {avg_disc_loss:.6f}) "
                     f"| Steps: {steps_per_epoch} | Time: {epoch_time:.1f}s | "
                     f"AvgData: {1000.0 * avg_data_time:.1f}ms | AvgCompute: {1000.0 * avg_compute_time:.1f}ms"
                 )
@@ -964,6 +1046,10 @@ def main(args: argparse.Namespace | None = None) -> None:
                 if is_best:
                     save_checkpoint(best_path, current_epoch, model, optimizer, best_loss, avg_loss)
                     validate_checkpoint_size(best_path, MIN_CHECKPOINT_MB)
+            scheduler.step(epoch + 1)
+            if rank == 0:
+                current_lr = optimizer.param_groups[0]["lr"]
+                print(f"[LR] Epoch {epoch + 1}: lr={current_lr:.2e}")
             if ddp_enabled:
                 dist.barrier()
     finally:

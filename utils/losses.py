@@ -96,12 +96,29 @@ class VGGPerceptualLoss(nn.Module):
         
         return F.l1_loss(self.slice(x), self.slice(y))
 
+
+class FrequencyColorLoss(nn.Module):
+    """
+    FFT-based AB-spectrum matching to encourage coherent color distribution.
+    """
+
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, pred_ab: torch.Tensor, target_ab: torch.Tensor) -> torch.Tensor:
+        pred_fft = torch.fft.fft2(pred_ab, norm="ortho")
+        target_fft = torch.fft.fft2(target_ab, norm="ortho")
+        pred_mag = torch.abs(pred_fft)
+        target_mag = torch.abs(target_fft)
+        return F.l1_loss(pred_mag, target_mag)
+
+
 class HybridColorizationLoss(nn.Module):
     """
     Combines:
     1. L1 (Huber) absolute color error penalty
     2. VGG perceptual divergence for semantic structural plausibility
-    3. Multi-scale SSIM to heavily discourage blurry, flat gradients that L1 favors
+    3. Frequency-domain AB matching to discourage flat/washy chroma outputs.
     """
     def __init__(self, l1_weight=1.0, perceptual_weight=0.2, ssim_weight=0.1):
         super().__init__()
@@ -111,7 +128,7 @@ class HybridColorizationLoss(nn.Module):
         
         self.l1_criterion = nn.L1Loss()
         self.vgg_criterion = VGGPerceptualLoss()
-        self.ssim_criterion = SSIMLoss()
+        self.freq_criterion = FrequencyColorLoss()
 
     def forward(self, pred_ab, target_ab, pred_rgb, target_rgb):
         """
@@ -125,7 +142,7 @@ class HybridColorizationLoss(nn.Module):
             total_loss (Tensor): Total combined focal loss scalar.
             loss_l1 (Tensor): Individual L1
             loss_vgg (Tensor): Individual VGG
-            loss_ssim (Tensor): Individual SSIM
+            loss_freq (Tensor): Individual frequency AB loss
         """
         # 1. L1 loss calculates the absolute distance in the 'ab' color coordinate space directly.
         loss_l1 = self.l1_criterion(pred_ab, target_ab)
@@ -133,17 +150,17 @@ class HybridColorizationLoss(nn.Module):
         # 2. Perceptual compares RGB representations for texture awareness using VGG relu2_2 features
         loss_vgg = self.vgg_criterion(pred_rgb, target_rgb)
         
-        # 3. SSIM enforces structural coherence across the generated ab mappings
-        loss_ssim = self.ssim_criterion(pred_ab, target_ab)
+        # 3. Frequency loss enforces coherent color spectrum across AB predictions.
+        loss_freq = self.freq_criterion(pred_ab, target_ab)
         
         # Combine using configurated weighting scales
         total_loss = (
-            (self.l1_weight * loss_l1) + 
+            (0.05 * loss_l1) + 
             (self.perceptual_weight * loss_vgg) + 
-            (self.ssim_weight * loss_ssim)
+            (self.ssim_weight * loss_freq)
         )
         
-        return total_loss, loss_l1, loss_vgg, loss_ssim
+        return total_loss, loss_l1, loss_vgg, loss_freq
 
 # --- Example Usage ---
 if __name__ == "__main__":
@@ -158,12 +175,12 @@ if __name__ == "__main__":
     criterion = HybridColorizationLoss()
     
     # Run forward pass
-    loss, l1, vgg, ssim = criterion(dummy_pred_ab, dummy_target_ab, dummy_pred_rgb, dummy_target_rgb)
+    loss, l1, vgg, freq = criterion(dummy_pred_ab, dummy_target_ab, dummy_pred_rgb, dummy_target_rgb)
     
     print(f"Total Combined Colorization Loss: {loss.item():.4f}")
     print(f" -> L1 Component: {l1.item():.4f}")
     print(f" -> VGG Perceptual Component: {vgg.item():.4f}")
-    print(f" -> SSIM Distance Component: {ssim.item():.4f}")
+    print(f" -> Frequency AB Component: {freq.item():.4f}")
     
     loss.backward()
     print("Backward pass gradients computed successfully on predicted tensors!")

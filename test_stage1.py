@@ -6,7 +6,7 @@ from skimage.color import lab2rgb
 
 # Load model
 model = UNetColorizer(in_channels=1, out_channels=2)
-ckpt = torch.load("checkpoints/stage1_colorizer.pth", map_location="cpu")
+ckpt = torch.load("checkpoints/stage1_colorizer_latest.pth", map_location="cpu")
 
 # handle both formats
 state_dict = ckpt.get("model_state_dict", ckpt)

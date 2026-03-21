@@ -4,8 +4,8 @@ from pathlib import Path
 from typing import Any, Dict, List, Sequence, Tuple
 
 import numpy as np
-from PIL import Image
-from skimage.color import rgb2lab
+from PIL import Image, ImageEnhance
+from skimage.color import lab2rgb, rgb2lab
 import torch
 from torch.nn import functional as F
 from torch.utils.data import ConcatDataset, Dataset
@@ -182,6 +182,31 @@ class ColorizationDataset(Dataset):
         return l.clamp(0.0, 1.0), ab.clamp(-1.0, 1.0)
 
 
+class LABAwareAugmentation:
+    """
+    RGB-space augmentations designed to diversify downstream LAB chroma targets.
+    """
+
+    def __init__(self, prob: float = 0.5):
+        self.prob = float(prob)
+
+    def __call__(self, rgb_image: Image.Image) -> Image.Image:
+        if random.random() < self.prob:
+            factor = random.uniform(0.7, 1.4)
+            rgb_image = ImageEnhance.Color(rgb_image).enhance(factor)
+
+        if random.random() < 0.3:
+            rgb_np = np.asarray(rgb_image, dtype=np.float32) / 255.0
+            lab = rgb2lab(rgb_np)
+            shift = random.uniform(-8.0, 8.0)
+            lab[:, :, 1] = np.clip(lab[:, :, 1] + shift, -128.0, 127.0)
+            lab[:, :, 2] = np.clip(lab[:, :, 2] + shift * 0.5, -128.0, 127.0)
+            rgb_aug = np.clip(lab2rgb(lab), 0.0, 1.0)
+            rgb_image = Image.fromarray((rgb_aug * 255.0).astype(np.uint8))
+
+        return rgb_image
+
+
 class ImageColorizationDataset(Dataset):
     """
     Loads RGB images and converts to LAB on-the-fly.
@@ -205,6 +230,7 @@ class ImageColorizationDataset(Dataset):
                 T.ColorJitter(brightness=0.15, contrast=0.15, saturation=0.15, hue=0.03),
             ]
         )
+        self.color_augment = LABAwareAugmentation(prob=0.5)
 
         if not self.root_dir.exists() or not self.root_dir.is_dir():
             raise FileNotFoundError(f"Colorization image dataset not found: {self.root_dir}")
@@ -285,6 +311,7 @@ class ImageColorizationDataset(Dataset):
 
         if self.augment:
             rgb = self.aug_transform(rgb)
+            rgb = self.color_augment(rgb)
 
         rgb_np = np.asarray(rgb, dtype=np.float32) / 255.0
         lab = rgb2lab(rgb_np).astype(np.float32)

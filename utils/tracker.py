@@ -11,6 +11,29 @@ def _unwrap_state_dict(model: torch.nn.Module) -> dict:
     return model.module.state_dict() if hasattr(model, "module") else model.state_dict()
 
 
+def log_color_diagnostics(
+    writer: SummaryWriter,
+    pred_ab: torch.Tensor,
+    target_ab: torch.Tensor,
+    epoch: int,
+    tag: str = "color",
+) -> None:
+    """
+    Logs per-epoch chroma trends and AB histograms for colorization collapse debugging.
+    """
+    with torch.no_grad():
+        pred_chroma = torch.sqrt(pred_ab[:, 0] ** 2 + pred_ab[:, 1] ** 2).mean().item()
+        target_chroma = torch.sqrt(target_ab[:, 0] ** 2 + target_ab[:, 1] ** 2).mean().item()
+        writer.add_scalar(f"{tag}/pred_mean_chroma", pred_chroma, epoch)
+        writer.add_scalar(f"{tag}/target_mean_chroma", target_chroma, epoch)
+        writer.add_scalar(f"{tag}/chroma_ratio", pred_chroma / (target_chroma + 1e-6), epoch)
+        writer.add_histogram(f"{tag}/pred_A", pred_ab[:, 0].flatten(), epoch)
+        writer.add_histogram(f"{tag}/pred_B", pred_ab[:, 1].flatten(), epoch)
+        writer.add_histogram(f"{tag}/target_A", target_ab[:, 0].flatten(), epoch)
+        vivid = (torch.sqrt(pred_ab[:, 0] ** 2 + pred_ab[:, 1] ** 2) > 0.2).float().mean().item()
+        writer.add_scalar(f"{tag}/vivid_pixel_fraction", vivid, epoch)
+
+
 class ModelTracker:
     """
     Tracks metrics and checkpoints for single-node and DDP training.
