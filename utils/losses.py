@@ -162,6 +162,77 @@ class HybridColorizationLoss(nn.Module):
         
         return total_loss, loss_l1, loss_vgg, loss_freq
 
+
+class ColorizationLossV2(nn.Module):
+    """
+    Upgraded v2 objective.
+    Combines:
+      - Low-weight L1
+      - Colorfulness composite (ratio + chroma mse + hue)
+      - Focal chroma under-saturation penalty
+      - AB histogram moment matching
+    Perceptual loss is computed externally in training for flexibility.
+    """
+
+    def __init__(
+        self,
+        l1_weight=0.02,
+        perceptual_weight=0.60,
+        colorfulness_weight=1.50,
+        focal_chroma_weight=0.80,
+        histogram_weight=0.40,
+    ):
+        super().__init__()
+        self.l1_weight = l1_weight
+        self.perceptual_weight = perceptual_weight
+        self.colorfulness_weight = colorfulness_weight
+        self.focal_chroma_weight = focal_chroma_weight
+        self.histogram_weight = histogram_weight
+        self.l1 = nn.L1Loss()
+        self.mse = nn.MSELoss()
+
+    def forward(self, pred_ab, target_ab, epoch=0, total_epochs=160):
+        loss_l1 = self.l1(pred_ab, target_ab)
+
+        pred_c = torch.sqrt(torch.clamp(pred_ab[:, 0] ** 2 + pred_ab[:, 1] ** 2, min=1e-8))
+        target_c = torch.sqrt(torch.clamp(target_ab[:, 0] ** 2 + target_ab[:, 1] ** 2, min=1e-8))
+
+        ratio = pred_c / (target_c + 1e-6)
+        ratio_pen = torch.relu(0.80 - ratio).mean()
+        chroma_mse = self.mse(pred_c, target_c)
+        pna = pred_ab[:, 0] / (pred_c + 1e-6)
+        pnb = pred_ab[:, 1] / (pred_c + 1e-6)
+        tna = target_ab[:, 0] / (target_c + 1e-6)
+        tnb = target_ab[:, 1] / (target_c + 1e-6)
+        hue = (1.0 - (pna * tna + pnb * tnb)).clamp(min=0).mean()
+        colorfulness = ratio_pen + 0.5 * chroma_mse + 0.3 * hue
+
+        err = torch.relu(target_c - pred_c)
+        fw = torch.pow(err / (target_c + 1e-6), 2.0)
+        focal = (fw * err).mean()
+
+        def stats(t):
+            return t.mean(), t.std() + 1e-6
+
+        am, as_ = stats(pred_ab[:, 0])
+        tam, tas = stats(target_ab[:, 0])
+        bm, bs = stats(pred_ab[:, 1])
+        tbm, tbs = stats(target_ab[:, 1])
+        hist = torch.abs(am - tam) + torch.abs(bm - tbm) + torch.abs(as_ - tas) + torch.abs(bs - tbs)
+
+        prog = float(epoch) / max(float(total_epochs), 1.0)
+        c_temp = self.colorfulness_weight * (0.5 + 1.0 * prog)
+        f_temp = self.focal_chroma_weight * (0.3 + 1.4 * prog)
+
+        total = (
+            self.l1_weight * loss_l1
+            + self.perceptual_weight * torch.tensor(0.0, device=pred_ab.device, dtype=pred_ab.dtype)
+            + c_temp * colorfulness
+            + f_temp * focal
+            + self.histogram_weight * hist
+        )
+        return total, loss_l1, colorfulness, focal, hist
+
 # --- Example Usage ---
 if __name__ == "__main__":
     # Simulate batch size 4, 256x256 resolution outputs

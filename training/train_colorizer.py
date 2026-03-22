@@ -35,6 +35,7 @@ from torchvision.models import VGG16_Weights, vgg16
 from datasets.dataset_colorizer import build_combined_colorization_dataset
 from models.patch_discriminator import PatchDiscriminator
 from models.unet_colorizer import UNetColorizer
+from utils.losses import ColorizationLossV2
 
 
 STAGE_NAME = "stage1_colorizer"
@@ -52,20 +53,22 @@ class VGGPerceptualLoss(torch.nn.Module):
         self.enabled = True
         try:
             backbone = vgg16(weights=VGG16_Weights.IMAGENET1K_V1)
-            # relu3_3 captures richer color/semantic regions than shallow relu2_2.
-            self.features = backbone.features[:23].eval()
-            for param in self.features.parameters():
+            features = backbone.features
+            # Three scales: relu2_2 (edges), relu3_3 (textures), relu4_3 (semantics/colour)
+            self.slice1 = features[:9].eval()
+            self.slice2 = features[:16].eval()
+            self.slice3 = features[:23].eval()
+            for param in list(self.slice1.parameters()) + list(self.slice2.parameters()) + list(self.slice3.parameters()):
                 param.requires_grad = False
         except Exception as exc:
-            # Keep training stable in offline environments where VGG weights are unavailable.
-            print(f"[WARN] Failed to load pretrained VGG16 for perceptual loss: {exc}")
+            print(f"[WARN] VGG16 load failed: {exc}")
             self.enabled = False
-            self.features = torch.nn.Identity()
+            self.slice1 = self.slice2 = self.slice3 = torch.nn.Identity()
 
         self.register_buffer("mean", torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1))
         self.register_buffer("std", torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1))
 
-    def _normalize(self, x: torch.Tensor) -> torch.Tensor:
+    def _norm(self, x: torch.Tensor) -> torch.Tensor:
         return (x - self.mean) / self.std
 
     @staticmethod
@@ -111,11 +114,13 @@ class VGGPerceptualLoss(torch.nn.Module):
 
         pred_rgb = self._lab_to_rgb(l_channel, pred_ab)
         target_rgb = self._lab_to_rgb(l_channel, target_ab)
+        px = self._norm(pred_rgb)
+        py = self._norm(target_rgb)
 
-        pred_feat = self.features(self._normalize(pred_rgb))
-        with torch.no_grad():
-            target_feat = self.features(self._normalize(target_rgb))
-        return F.l1_loss(pred_feat, target_feat)
+        loss = 1.0 * F.l1_loss(self.slice1(px), self.slice1(py).detach())
+        loss += 1.5 * F.l1_loss(self.slice2(px), self.slice2(py).detach())
+        loss += 2.0 * F.l1_loss(self.slice3(px), self.slice3(py).detach())
+        return loss / 4.5
 
 
 def parse_args() -> argparse.Namespace:
@@ -131,9 +136,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--grad-log-interval", type=int, default=100)
     parser.add_argument("--perf-log-interval", type=int, default=50)
     parser.add_argument("--image-size", type=int, default=256)
-    parser.add_argument("--perceptual-weight", type=float, default=0.5)
-    parser.add_argument("--colorfulness-weight", type=float, default=1.0)
-    parser.add_argument("--chroma-target-ratio", type=float, default=0.85)
+    parser.add_argument("--perceptual-weight", type=float, default=0.6)
+    parser.add_argument("--colorfulness-weight", type=float, default=1.5)
+    parser.add_argument("--chroma-target-ratio", type=float, default=0.80)
+    parser.add_argument("--histogram-weight", type=float, default=0.4, help="AB histogram matching loss weight")
+    parser.add_argument("--focal-chroma-weight", type=float, default=0.8, help="Focal chroma loss")
+    parser.add_argument("--disable-gan", action="store_true", help="Disable PatchGAN discriminator (recommended)")
     parser.add_argument("--gan-start-epoch", type=int, default=30)
     parser.add_argument("--gan-weight", type=float, default=0.1)
     parser.add_argument("--accum-steps", type=int, default=1)
@@ -765,21 +773,36 @@ def main(args: argparse.Namespace | None = None) -> None:
         if rank == 0 and not perceptual_loss_fn.enabled:
             print("[WARN] Perceptual loss disabled.")
         if rank == 0:
-            print(f"Loss weights: L1=0.05, P={args.perceptual_weight}, C={args.colorfulness_weight}")
-
-        # PatchGAN discriminator for adversarial color realism (activates after warmup epochs).
-        disc = PatchDiscriminator(in_channels=3).to(device)
-        if ddp_enabled:
-            disc = DDP(
-                disc,
-                device_ids=[local_rank],
-                broadcast_buffers=False,
-                gradient_as_bucket_view=True,
-                bucket_cap_mb=ddp_bucket_cap_mb,
-                find_unused_parameters=False,
+            print(
+                f"Loss weights: L1=0.02, P={args.perceptual_weight}, C={args.colorfulness_weight}, "
+                f"Focal={args.focal_chroma_weight}, Hist={args.histogram_weight}"
             )
-        disc_optimizer = optim.AdamW(disc.parameters(), lr=args.lr * 0.5, weight_decay=args.weight_decay)
-        gan_criterion = nn.BCEWithLogitsLoss().to(device)
+
+        # Keep v2 loss object available for debug/inspection compatibility.
+        _ = ColorizationLossV2(
+            l1_weight=0.02,
+            perceptual_weight=args.perceptual_weight,
+            colorfulness_weight=args.colorfulness_weight,
+            focal_chroma_weight=args.focal_chroma_weight,
+            histogram_weight=args.histogram_weight,
+        )
+
+        disc = None
+        disc_optimizer = None
+        gan_criterion = None
+        if not args.disable_gan:
+            disc = PatchDiscriminator(in_channels=3).to(device)
+            if ddp_enabled:
+                disc = DDP(
+                    disc,
+                    device_ids=[local_rank],
+                    broadcast_buffers=False,
+                    gradient_as_bucket_view=True,
+                    bucket_cap_mb=ddp_bucket_cap_mb,
+                    find_unused_parameters=False,
+                )
+            disc_optimizer = optim.AdamW(disc.parameters(), lr=args.lr * 0.5, weight_decay=args.weight_decay)
+            gan_criterion = nn.BCEWithLogitsLoss().to(device)
 
         scaler = GradScaler(enabled=True)
         accum_steps = max(1, int(args.accum_steps))
@@ -852,7 +875,8 @@ def main(args: argparse.Namespace | None = None) -> None:
             if sampler is not None:
                 sampler.set_epoch(epoch)
             model.train()
-            disc.train()
+            if disc is not None:
+                disc.train()
             torch.cuda.reset_peak_memory_stats(device)
 
             running_loss = 0.0
@@ -883,14 +907,25 @@ def main(args: argparse.Namespace | None = None) -> None:
                     with ddp_sync_context:
                         with autocast(enabled=True):
                             ab_pred = torch.clamp(model(l_channel), -1.0, 1.0)
+
+                            # 1. L1 loss — kept very small to stop rewarding grey
                             l1_loss = criterion(ab_pred, ab_target)
+
+                            # 2. Multi-scale perceptual loss
                             p_loss = perceptual_loss_fn(ab_pred, ab_target, l_channel)
 
+                            # 3. Chroma components
                             pred_chroma = torch.sqrt(torch.clamp(ab_pred[:, 0] ** 2 + ab_pred[:, 1] ** 2, min=1e-8))
                             target_chroma = torch.sqrt(torch.clamp(ab_target[:, 0] ** 2 + ab_target[:, 1] ** 2, min=1e-8))
+
+                            # 3a. Ratio penalty
                             chroma_ratio = pred_chroma / (target_chroma + 1e-6)
                             ratio_penalty = torch.relu(args.chroma_target_ratio - chroma_ratio).mean()
+
+                            # 3b. Chroma MSE
                             chroma_mse = F.mse_loss(pred_chroma, target_chroma)
+
+                            # 3c. Hue alignment
                             pred_norm_a = ab_pred[:, 0] / (pred_chroma + 1e-6)
                             pred_norm_b = ab_pred[:, 1] / (pred_chroma + 1e-6)
                             tgt_norm_a = ab_target[:, 0] / (target_chroma + 1e-6)
@@ -898,12 +933,44 @@ def main(args: argparse.Namespace | None = None) -> None:
                             hue_loss = (1.0 - (pred_norm_a * tgt_norm_a + pred_norm_b * tgt_norm_b)).clamp(min=0).mean()
                             colorfulness = ratio_penalty + 0.5 * chroma_mse + 0.3 * hue_loss
 
+                            # 4. Focal chroma loss — heavily penalize under-saturation
+                            chroma_error = torch.relu(target_chroma - pred_chroma)
+                            focal_weight = torch.pow(chroma_error / (target_chroma + 1e-6), 2.0)
+                            focal_chroma = (focal_weight * chroma_error).mean()
+
+                            # 5. AB histogram matching loss
+                            pred_a_mean = ab_pred[:, 0].mean()
+                            tgt_a_mean = ab_target[:, 0].mean()
+                            pred_b_mean = ab_pred[:, 1].mean()
+                            tgt_b_mean = ab_target[:, 1].mean()
+                            pred_a_std = ab_pred[:, 0].std() + 1e-6
+                            tgt_a_std = ab_target[:, 0].std() + 1e-6
+                            pred_b_std = ab_pred[:, 1].std() + 1e-6
+                            tgt_b_std = ab_target[:, 1].std() + 1e-6
+                            hist_loss = (
+                                torch.abs(pred_a_mean - tgt_a_mean)
+                                + torch.abs(pred_b_mean - tgt_b_mean)
+                                + torch.abs(pred_a_std - tgt_a_std)
+                                + torch.abs(pred_b_std - tgt_b_std)
+                            )
+
+                            # 6. Temperature schedule for chroma/focal terms
+                            epoch_progress = float(epoch) / max(float(args.epochs), 1.0)
+                            colorfulness_temp = args.colorfulness_weight * (0.5 + 1.0 * epoch_progress)
+                            focal_temp = args.focal_chroma_weight * (0.3 + 1.4 * epoch_progress)
+
+                            # 7. Total loss
                             total_loss = (
-                                0.05 * l1_loss + args.perceptual_weight * p_loss + args.colorfulness_weight * colorfulness
+                                0.02 * l1_loss
+                                + args.perceptual_weight * p_loss
+                                + colorfulness_temp * colorfulness
+                                + focal_temp * focal_chroma
+                                + args.histogram_weight * hist_loss
                             )
 
                             g_adv = l1_loss.new_tensor(0.0)
-                            if epoch >= int(args.gan_start_epoch):
+                            gan_enabled = (not getattr(args, "disable_gan", True)) and (epoch >= int(args.gan_start_epoch))
+                            if gan_enabled and disc is not None and gan_criterion is not None:
                                 for param in disc.parameters():
                                     param.requires_grad_(False)
                                 fake_rgb_gen = perceptual_loss_fn._lab_to_rgb(l_channel, ab_pred)
@@ -916,7 +983,7 @@ def main(args: argparse.Namespace | None = None) -> None:
                             loss = total_loss / accumulation_divisor
 
                     d_loss = l1_loss.new_tensor(0.0)
-                    if epoch >= int(args.gan_start_epoch) and sync_gradients:
+                    if gan_enabled and sync_gradients and disc is not None and disc_optimizer is not None and gan_criterion is not None:
                         with torch.no_grad():
                             fake_rgb = perceptual_loss_fn._lab_to_rgb(l_channel, ab_pred.detach()).float()
                             real_rgb = perceptual_loss_fn._lab_to_rgb(l_channel, ab_target).float()
@@ -1019,9 +1086,11 @@ def main(args: argparse.Namespace | None = None) -> None:
             epoch_time = time.time() - epoch_start
 
             if rank == 0:
+                chroma_target = 0.20
+                chroma_status = "OK" if avg_colorfulness > chroma_target else "WARN"
                 print(
                     f"Epoch [{epoch + 1}/{args.epochs}] | Loss: {avg_loss:.6f} "
-                    f"(L1: {avg_l1_loss:.6f}, P: {avg_perceptual_loss:.6f}, Chroma: {avg_colorfulness:.6f}, "
+                    f"(L1: {avg_l1_loss:.6f}, P: {avg_perceptual_loss:.6f}, Chroma: {avg_colorfulness:.6f} {chroma_status}, "
                     f"GAdv: {avg_gan_loss:.6f}, D: {avg_disc_loss:.6f}) "
                     f"| Steps: {steps_per_epoch} | Time: {epoch_time:.1f}s | "
                     f"AvgData: {1000.0 * avg_data_time:.1f}ms | AvgCompute: {1000.0 * avg_compute_time:.1f}ms"
@@ -1046,7 +1115,7 @@ def main(args: argparse.Namespace | None = None) -> None:
                 if is_best:
                     save_checkpoint(best_path, current_epoch, model, optimizer, best_loss, avg_loss)
                     validate_checkpoint_size(best_path, MIN_CHECKPOINT_MB)
-            scheduler.step(epoch + 1)
+            scheduler.step()
             if rank == 0:
                 current_lr = optimizer.param_groups[0]["lr"]
                 print(f"[LR] Epoch {epoch + 1}: lr={current_lr:.2e}")
