@@ -6,9 +6,11 @@ from pathlib import Path
 import torch
 import torch.distributed as dist
 import torch.optim as optim
+from torch.amp import autocast, GradScaler
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
+from tqdm import tqdm
 
 from datasets.dataset_depth import DepthDataset
 from models.depth_model import DynamicFilterNetwork
@@ -183,29 +185,40 @@ def main() -> None:
             )
 
         prev_epoch_loss = None
+        scaler = GradScaler()
+        
         for epoch in range(start_epoch, args.epochs):
             epoch_start = time.time()
             sampler.set_epoch(epoch)
             model.train()
             running_loss = 0.0
             zero_grad_counter = 0
+            
+            if rank == 0:
+                dataloader = tqdm(loader, desc=f"Epoch {epoch + 1}/{args.epochs}", total=steps_per_epoch, unit="batch")
+            else:
+                dataloader = loader
 
-            for step, (images, depth_maps) in enumerate(loader, start=1):
+            for step, (images, depth_maps) in enumerate(dataloader, start=1):
                 images = images.to(device, non_blocking=True)
                 depth_maps = depth_maps.to(device, non_blocking=True)
 
                 optimizer.zero_grad(set_to_none=True)
-                pred = model(images)
-                loss = criterion(pred, depth_maps)
+                
+                with autocast("cuda"):
+                    pred = model(images)
+                    loss = criterion(pred, depth_maps)
+                
                 if torch.isnan(loss):
-                    raise RuntimeError("NaN loss detected")
-                loss.backward()
+                    raise RuntimeError(f"NaN loss detected at step {step}")
+                
+                scaler.scale(loss).backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                scaler.step(optimizer)
+                scaler.update()
 
                 grad_norm = compute_grad_norm(model)
-                if step % args.grad_log_interval == 0 and rank == 0:
-                    print(f"Grad norm: {grad_norm:.6e}")
-
+                
                 if grad_norm <= 1e-12:
                     zero_grad_counter += 1
                     if zero_grad_counter >= 5:
@@ -213,8 +226,10 @@ def main() -> None:
                 else:
                     zero_grad_counter = 0
 
-                optimizer.step()
                 running_loss += float(loss.item())
+                
+                if rank == 0:
+                    dataloader.set_postfix(loss=f"{loss.item():.4f}")
 
             stats = torch.tensor([running_loss], device=device)
             dist.all_reduce(stats, op=dist.ReduceOp.SUM)
@@ -223,10 +238,10 @@ def main() -> None:
             improved_vs_prev = prev_epoch_loss is None or avg_loss < prev_epoch_loss
 
             if rank == 0:
-                improved_text = "yes" if improved_vs_prev else "no"
+                improved_text = "✓ yes" if improved_vs_prev else "✗ no"
                 print(
                     f"Epoch [{epoch + 1}/{args.epochs}] | Loss: {avg_loss:.6f} "
-                    f"| Steps: {steps_per_epoch} | Time: {epoch_time:.1f}s | Improved: {improved_text}"
+                    f"| Time: {epoch_time:.1f}s | Improved: {improved_text}"
                 )
             prev_epoch_loss = avg_loss
 
