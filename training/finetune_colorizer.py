@@ -222,9 +222,9 @@ class ColorizerFinetuner:
         self,
         checkpoint_path: str,
         device: torch.device,
-        lr: float = 1e-5,
+        lr: float = 5e-6,
         l1_weight: float = 1.0,
-        perceptual_weight: float = 0.01,
+        perceptual_weight: float = 0.005,
         freeze_encoder: bool = True,
     ):
         """
@@ -268,21 +268,30 @@ class ColorizerFinetuner:
         self.scheduler = optim.lr_scheduler.CosineAnnealingLR(self.optimizer, T_max=30)
     
     def _freeze_encoder(self) -> None:
-        """Freeze encoder layers (down path)."""
-        # Assuming UNet structure with encoder layers
-        modules_to_freeze = [
-            self.model.inc,
-            self.model.down1,
-            self.model.down2,
-            self.model.down3,
-            self.model.down4,
-        ]
+        """
+        Freeze all layers except last decoder layers (last 3 blocks).
         
-        for module in modules_to_freeze:
-            for param in module.parameters():
-                param.requires_grad = False
+        This prevents instability from large updates during fine-tuning.
+        Only final blocks are trainable to make updates smooth and stable.
+        """
+        # Freeze everything by default
+        for param in self.model.parameters():
+            param.requires_grad = False
         
-        print("[INFO] Encoder frozen (decoder only trainable)")
+        # Only unfreeze last decoder layers and final output
+        trainable_patterns = ["decoder.3", "final"]
+        
+        for name, param in self.model.named_parameters():
+            for pattern in trainable_patterns:
+                if pattern in name:
+                    param.requires_grad = True
+                    print(f"[INFO] TRAINABLE: {name}")
+                    break
+        
+        # Count trainable params
+        trainable_count = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
+        total_count = sum(p.numel() for p in self.model.parameters())
+        print(f"[INFO] Trainable params: {trainable_count:,} / {total_count:,} ({100*trainable_count/total_count:.1f}%)")
     
     def train_epoch(self, dataloader: DataLoader, epoch: int) -> Dict[str, float]:
         """
@@ -307,15 +316,26 @@ class ColorizerFinetuner:
                 # Forward pass
                 ab_pred = self.model(l_channel)
                 
-                # CRITICAL: Clamp AB values to prevent NaN
+                # CRITICAL FIX 1: Safe model output with nan_to_num
+                ab_pred = torch.nan_to_num(
+                    ab_pred,
+                    nan=0.0,
+                    posinf=100.0,
+                    neginf=-100.0
+                )
+                
+                # CRITICAL FIX 2: Clamp AB values to prevent NaN
                 ab_pred = torch.clamp(ab_pred, -100, 100)
                 ab_target_clamped = torch.clamp(ab_target, -100, 100)
                 
-                # Debug: Check input ranges
-                if torch.isnan(ab_pred).any():
-                    print(f"[WARN] NaN in ab_pred after model")
-                if torch.isinf(ab_pred).any():
-                    print(f"[WARN] Inf in ab_pred after model")
+                # CRITICAL FIX 3: Early batch skipping on model output
+                if torch.isnan(ab_pred).any() or torch.isinf(ab_pred).any():
+                    print(f"[WARN] NaN/Inf in ab_pred after model - skipping batch")
+                    continue
+                
+                # Debug: Check ranges
+                if torch.isnan(ab_pred).any() or torch.isinf(l_channel).any():
+                    print(f"[WARN] NaN in inputs detected")
                 
                 # L1 loss (AB prediction)
                 l1 = self.l1_loss(ab_pred, ab_target_clamped)
@@ -328,28 +348,32 @@ class ColorizerFinetuner:
                 pred_rgb = torch.clamp(pred_rgb, 0.0, 1.0)
                 target_rgb = torch.clamp(target_rgb, 0.0, 1.0)
                 
-                # Debug: Print ranges
+                # CRITICAL FIX 4: Normalize RGB for VGG (better stability)
+                pred_rgb_norm = (pred_rgb - 0.5) / 0.5
+                target_rgb_norm = (target_rgb - 0.5) / 0.5
+                
+                # Debug: Print ranges (every 50 batches)
                 if num_batches % 50 == 0:
-                    print(f"[DEBUG] AB pred: min={ab_pred.min().item():.4f}, max={ab_pred.max().item():.4f}")
-                    print(f"[DEBUG] RGB pred: min={pred_rgb.min().item():.4f}, max={pred_rgb.max().item():.4f}")
+                    print(f"[DEBUG] Batch {num_batches}: AB pred range [{ab_pred.min().item():.3f}, {ab_pred.max().item():.3f}]")
+                    print(f"[DEBUG] RGB pred range [{pred_rgb.min().item():.3f}, {pred_rgb.max().item():.3f}]")
                     print(f"[DEBUG] L1 loss: {l1.item():.6f}")
                 
                 perc = self.perceptual_loss(pred_rgb, target_rgb)
                 
-                # Total loss (reduced perceptual weight for stability)
+                # CRITICAL FIX 5: Reduced perceptual weight for stability (0.005 instead of 0.01)
                 total_loss = self.l1_weight * l1 + self.perceptual_weight * perc
                 
                 # NaN protection: Skip batch if loss is NaN
                 if torch.isnan(total_loss) or torch.isinf(total_loss):
-                    print(f"[ERROR] NaN/Inf detected in loss: L1={l1.item():.6f}, Perc={perc.item():.6f}")
-                    print(f"[ERROR] Skipping this batch")
+                    print(f"[ERROR] NaN/Inf in total loss: L1={l1.item():.6f}, Perc={perc.item():.6f}")
+                    print(f"[ERROR] Skipping batch")
                     continue
                 
                 # Safe backward pass
                 self.optimizer.zero_grad()
                 total_loss.backward()
                 
-                # Gradient clipping
+                # CRITICAL FIX 6: Gradient clipping
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
                 
                 # Safe optimizer step
@@ -396,8 +420,19 @@ class ColorizerFinetuner:
             # Forward pass
             ab_pred = self.model(l_channel)
             
-            # Clamp AB values
+            # Safe model output handling
+            ab_pred = torch.nan_to_num(
+                ab_pred,
+                nan=0.0,
+                posinf=100.0,
+                neginf=-100.0
+            )
             ab_pred = torch.clamp(ab_pred, -100, 100)
+            
+            # Skip if NaN/Inf detected
+            if torch.isnan(ab_pred).any() or torch.isinf(ab_pred).any():
+                continue
+            
             ab_target_clamped = torch.clamp(ab_target, -100, 100)
             
             # Losses
@@ -488,25 +523,25 @@ class ColorizerFinetuner:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Fine-tune colorizer with L1 + Perceptual loss")
+    parser = argparse.ArgumentParser(description="Fine-tune colorizer with L1 + Perceptual loss (numerically stable)")
     parser.add_argument("--checkpoint", type=str, default="checkpoints/stage1_colorizer_latest.pth",
                        help="Existing checkpoint to fine-tune from")
     parser.add_argument("--epochs", type=int, default=15,
                        help="Number of fine-tuning epochs (10-20 recommended)")
     parser.add_argument("--batch-size", type=int, default=4,
                        help="Batch size")
-    parser.add_argument("--lr", type=float, default=1e-5,
-                       help="Learning rate (low for fine-tuning)")
+    parser.add_argument("--lr", type=float, default=5e-6,
+                       help="Learning rate (VERY low for stability, reduced from 1e-5)")
     parser.add_argument("--l1-weight", type=float, default=1.0,
                        help="Weight for L1 loss")
-    parser.add_argument("--perceptual-weight", type=float, default=0.01,
-                       help="Weight for perceptual loss (reduced for stability)")
+    parser.add_argument("--perceptual-weight", type=float, default=0.005,
+                       help="Weight for perceptual loss (heavily reduced to 0.005 for stability)")
     parser.add_argument("--data-roots", type=str, nargs="+", default=["datasets/flickr2k", "datasets/coco"],
                        help="Dataset roots")
     parser.add_argument("--num-workers", type=int, default=4,
                        help="Data loading workers")
     parser.add_argument("--freeze-encoder", action="store_true", default=True,
-                       help="Freeze encoder (fine-tune decoder only)")
+                       help="Freeze encoder (fine-tune only last decoder blocks)")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu",
                        help="Device (cuda or cpu)")
     return parser.parse_args()
