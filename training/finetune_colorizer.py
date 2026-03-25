@@ -35,14 +35,6 @@ Usage:
         --perceptual-weight 0.0
 """
 
-Usage:
-    python training/finetune_colorizer.py \
-        --checkpoint checkpoints/stage1_colorizer_latest.pth \
-        --epochs 15 \
-        --batch-size 4 \
-        --lr 1e-5
-"""
-
 import argparse
 import os
 import sys
@@ -450,7 +442,7 @@ class ColorizerFinetuner:
                 pbar.set_postfix({
                     "L1": f"{l1.item():.4f}",
                     "Total": f"{total_loss.item():.4f}",
-                    f"Skip: {skipped_batches}",
+                    "Skip": f"{skipped_batches}",
                 })
         
         # Log epoch stats
@@ -569,10 +561,8 @@ class ColorizerFinetuner:
             val_losses = self.validate(val_loader)
             
             # Log
-            print(f"  Train: L1={train_losses['l1']:.6f}, Perc={train_losses['perceptual']:.6f}, "
-                  f"Total={train_losses['total']:.6f} [{train_time:.1f}s]")
-            print(f"  Val:   L1={val_losses['l1']:.6f}, Perc={val_losses['perceptual']:.6f}, "
-                  f"Total={val_losses['total']:.6f}")
+            print(f"  Train: L1={train_losses['l1']:.6f}, Total={train_losses['total']:.6f} [{train_time:.1f}s]")
+            print(f"  Val:   L1={val_losses['l1']:.6f}, Total={val_losses['total']:.6f}")
             
             # Save best
             if val_losses["total"] < best_val_loss:
