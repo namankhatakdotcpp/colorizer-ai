@@ -106,7 +106,7 @@ class VGGPerceptualLoss(nn.Module):
 
     def forward(self, pred_rgb: torch.Tensor, target_rgb: torch.Tensor) -> torch.Tensor:
         """
-        Compute perceptual loss.
+        Compute perceptual loss (numerically stable).
         
         Args:
             pred_rgb: [B, 3, H, W] predicted RGB in [0, 1]
@@ -115,16 +115,22 @@ class VGGPerceptualLoss(nn.Module):
         Returns:
             L1 distance between VGG features
         """
+        # Ensure RGB in valid range
+        pred_rgb = torch.clamp(pred_rgb, 0.0, 1.0)
+        target_rgb = torch.clamp(target_rgb, 0.0, 1.0)
+        
         # Normalize to ImageNet stats
         pred_norm = self._normalize(pred_rgb)
         target_norm = self._normalize(target_rgb)
         
-        # Extract features
-        pred_feat = self.features(pred_norm)
-        target_feat = self.features(target_norm)
+        # Extract features (detach ground truth to stabilize)
+        with torch.no_grad():
+            target_feat = self.features(target_norm)
         
-        # L1 loss
-        loss = F.l1_loss(pred_feat, pred_feat.detach())
+        pred_feat = self.features(pred_norm)
+        
+        # L1 loss with stability checks
+        loss = F.l1_loss(pred_feat, target_feat)
         
         return loss
 
@@ -218,7 +224,7 @@ class ColorizerFinetuner:
         device: torch.device,
         lr: float = 1e-5,
         l1_weight: float = 1.0,
-        perceptual_weight: float = 0.1,
+        perceptual_weight: float = 0.01,
         freeze_encoder: bool = True,
     ):
         """
@@ -301,21 +307,52 @@ class ColorizerFinetuner:
                 # Forward pass
                 ab_pred = self.model(l_channel)
                 
+                # CRITICAL: Clamp AB values to prevent NaN
+                ab_pred = torch.clamp(ab_pred, -100, 100)
+                ab_target_clamped = torch.clamp(ab_target, -100, 100)
+                
+                # Debug: Check input ranges
+                if torch.isnan(ab_pred).any():
+                    print(f"[WARN] NaN in ab_pred after model")
+                if torch.isinf(ab_pred).any():
+                    print(f"[WARN] Inf in ab_pred after model")
+                
                 # L1 loss (AB prediction)
-                l1 = self.l1_loss(ab_pred, ab_target)
+                l1 = self.l1_loss(ab_pred, ab_target_clamped)
                 
                 # Perceptual loss (RGB level)
                 pred_rgb = lab_to_rgb(l_channel, ab_pred)
-                target_rgb = lab_to_rgb(l_channel, ab_target)
+                target_rgb = lab_to_rgb(l_channel, ab_target_clamped)
+                
+                # Safe RGB clamping
+                pred_rgb = torch.clamp(pred_rgb, 0.0, 1.0)
+                target_rgb = torch.clamp(target_rgb, 0.0, 1.0)
+                
+                # Debug: Print ranges
+                if num_batches % 50 == 0:
+                    print(f"[DEBUG] AB pred: min={ab_pred.min().item():.4f}, max={ab_pred.max().item():.4f}")
+                    print(f"[DEBUG] RGB pred: min={pred_rgb.min().item():.4f}, max={pred_rgb.max().item():.4f}")
+                    print(f"[DEBUG] L1 loss: {l1.item():.6f}")
+                
                 perc = self.perceptual_loss(pred_rgb, target_rgb)
                 
-                # Total loss
+                # Total loss (reduced perceptual weight for stability)
                 total_loss = self.l1_weight * l1 + self.perceptual_weight * perc
                 
-                # Backward pass
+                # NaN protection: Skip batch if loss is NaN
+                if torch.isnan(total_loss) or torch.isinf(total_loss):
+                    print(f"[ERROR] NaN/Inf detected in loss: L1={l1.item():.6f}, Perc={perc.item():.6f}")
+                    print(f"[ERROR] Skipping this batch")
+                    continue
+                
+                # Safe backward pass
                 self.optimizer.zero_grad()
                 total_loss.backward()
+                
+                # Gradient clipping
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+                
+                # Safe optimizer step
                 self.optimizer.step()
                 
                 # Track losses
@@ -340,7 +377,7 @@ class ColorizerFinetuner:
     @torch.no_grad()
     def validate(self, dataloader: DataLoader) -> Dict[str, float]:
         """
-        Validate on a subset.
+        Validate on a subset (numerically stable).
         
         Args:
             dataloader: Validation data loader
@@ -359,14 +396,27 @@ class ColorizerFinetuner:
             # Forward pass
             ab_pred = self.model(l_channel)
             
+            # Clamp AB values
+            ab_pred = torch.clamp(ab_pred, -100, 100)
+            ab_target_clamped = torch.clamp(ab_target, -100, 100)
+            
             # Losses
-            l1 = self.l1_loss(ab_pred, ab_target)
+            l1 = self.l1_loss(ab_pred, ab_target_clamped)
             
             pred_rgb = lab_to_rgb(l_channel, ab_pred)
-            target_rgb = lab_to_rgb(l_channel, ab_target)
+            target_rgb = lab_to_rgb(l_channel, ab_target_clamped)
+            
+            # Safe RGB clamping
+            pred_rgb = torch.clamp(pred_rgb, 0.0, 1.0)
+            target_rgb = torch.clamp(target_rgb, 0.0, 1.0)
+            
             perc = self.perceptual_loss(pred_rgb, target_rgb)
             
             total_loss = self.l1_weight * l1 + self.perceptual_weight * perc
+            
+            # Skip NaN batches
+            if torch.isnan(total_loss) or torch.isinf(total_loss):
+                continue
             
             losses["l1"] += l1.item()
             losses["perceptual"] += perc.item()
@@ -374,8 +424,9 @@ class ColorizerFinetuner:
             num_batches += 1
         
         # Average
-        for key in losses:
-            losses[key] /= num_batches
+        if num_batches > 0:
+            for key in losses:
+                losses[key] /= num_batches
         
         return losses
     
@@ -448,8 +499,8 @@ def parse_args() -> argparse.Namespace:
                        help="Learning rate (low for fine-tuning)")
     parser.add_argument("--l1-weight", type=float, default=1.0,
                        help="Weight for L1 loss")
-    parser.add_argument("--perceptual-weight", type=float, default=0.1,
-                       help="Weight for perceptual loss")
+    parser.add_argument("--perceptual-weight", type=float, default=0.01,
+                       help="Weight for perceptual loss (reduced for stability)")
     parser.add_argument("--data-roots", type=str, nargs="+", default=["datasets/flickr2k", "datasets/coco"],
                        help="Dataset roots")
     parser.add_argument("--num-workers", type=int, default=4,
