@@ -8,8 +8,9 @@ high-quality image refinement.
 import argparse
 import json
 import logging
+import os
 from pathlib import Path
-from typing import Dict, Tuple
+from typing import Dict, Tuple, Optional
 
 import torch
 import torch.nn as nn
@@ -18,6 +19,7 @@ from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 import cv2
 import numpy as np
+from torchvision.utils import save_image
 
 from models.gan_generator import GANGenerator
 from models.gan_discriminator import PatchGANDiscriminator, MultiscaleDiscriminator
@@ -352,7 +354,7 @@ class GANRefinementTrainer:
             "loss_adversarial": loss_adv_g.item(),
         }
 
-    def train_epoch(self, data_loader: DataLoader) -> Dict[str, float]:
+    def train_epoch(self, data_loader: DataLoader) -> Tuple[Dict[str, float], Optional[torch.Tensor]]:
         """
         Train for one epoch.
 
@@ -360,7 +362,7 @@ class GANRefinementTrainer:
             data_loader: DataLoader for training data
 
         Returns:
-            Dictionary with average loss values
+            Tuple of (average losses dict, first batch sample images)
         """
         self.generator.train()
         self.discriminator.train()
@@ -373,12 +375,19 @@ class GANRefinementTrainer:
             "loss_adversarial": [],
         }
 
+        sample_images = None
+
         with tqdm(total=len(data_loader), desc="Training") as pbar:
-            for batch in data_loader:
+            for batch_idx, batch in enumerate(data_loader):
                 colorized = batch["colorized"].to(self.device)
                 target = batch["target"].to(self.device)
 
                 losses = self.train_step(colorized, target)
+
+                # Capture sample images from first batch for visualization
+                if batch_idx == 0 and sample_images is None:
+                    with torch.no_grad():
+                        sample_images = self.generator(colorized[:4] if colorized.size(0) >= 4 else colorized)
 
                 for key, value in losses.items():
                     epoch_losses[key].append(value)
@@ -394,7 +403,7 @@ class GANRefinementTrainer:
             key: np.mean(values) for key, values in epoch_losses.items()
         }
 
-        return avg_losses
+        return avg_losses, sample_images
 
     def validate(self, data_loader: DataLoader) -> Dict[str, float]:
         """
@@ -595,6 +604,11 @@ def main():
     if args.resume:
         start_epoch = trainer.load_checkpoint(Path(args.resume))
 
+    # Create output directory for sample images
+    samples_dir = Path(args.output_dir).parent / "outputs" / "gan_samples"
+    samples_dir.mkdir(parents=True, exist_ok=True)
+    logger.info(f"Sample images will be saved to: {samples_dir}")
+
     # Training loop
     logger.info(f"Starting training for {args.num_epochs} epochs...")
 
@@ -603,7 +617,7 @@ def main():
         logger.info(f"Epoch {epoch + 1}/{args.num_epochs}")
         logger.info(f"{'='*60}")
 
-        losses = trainer.train_epoch(data_loader)
+        losses, sample_images = trainer.train_epoch(data_loader)
 
         trainer.training_history["epoch"].append(epoch + 1)
         for key, value in losses.items():
@@ -616,6 +630,20 @@ def main():
         logger.info(f"Loss L1: {losses['loss_l1']:.4f}")
         logger.info(f"Loss Perceptual: {losses['loss_perceptual']:.4f}")
         logger.info(f"Loss Adversarial: {losses['loss_adversarial']:.4f}")
+
+        # Save sample images every epoch
+        if sample_images is not None:
+            try:
+                sample_path = samples_dir / f"epoch_{epoch + 1}.png"
+                save_image(
+                    sample_images,
+                    str(sample_path),
+                    normalize=True,
+                    nrow=2,
+                )
+                logger.info(f"Sample images saved to {sample_path}")
+            except Exception as e:
+                logger.warning(f"Failed to save sample images: {e}")
 
         # Save checkpoint
         if (epoch + 1) % 10 == 0:
