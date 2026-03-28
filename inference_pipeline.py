@@ -82,9 +82,9 @@ def _load_checkpoint(model: torch.nn.Module, checkpoint_path: Path, device: torc
 def get_default_checkpoint_map() -> Dict[str, str]:
     """Default checkpoint filenames for each stage."""
     return {
-        "colorizer": "stage1_colorizer.pth",
-        "sr": "stage2_sr.pth",
-        "depth": "stage3_depth.pth",
+        "colorizer": "stage1_colorizer_latest.pth",
+        "sr": "stage2_sr_latest.pth",
+        "depth": "stage3_depth_latest.pth",
         "bokeh": "stage4_bokeh.pth",
         "tone": "stage5_tone.pth",
         "contrast": "stage6_contrast.pth",
@@ -197,7 +197,7 @@ class PipelineStage:
 
 class ColorizerStage(PipelineStage):
     stage_name = "colorizer"
-    checkpoint_name = "stage1_colorizer.pth"
+    checkpoint_name = "stage1_colorizer_latest.pth"
     required = True
 
     def build_model(self) -> torch.nn.Module:
@@ -210,78 +210,94 @@ class ColorizerStage(PipelineStage):
         context = kwargs.get("context", {})
         l_np = context.get("l_np")
         if l_np is None:
-            raise RuntimeError("ColorizerStage requires context['l_np'] for LAB reconstruction.")
+            raise RuntimeError("ColorizerStage requires context['l_np']")
 
-        color_boost = float(context.get("color_boost", self.options.get("color_boost", 1.0)))
-        ab_clip = float(self.options.get("ab_clip", 110.0))  # Reduced from 128 to 110
-        enable_postprocess = bool(context.get("enable_postprocess", True))
-        enable_bilateral = bool(context.get("enable_bilateral", True))
-        enable_gaussian = bool(context.get("enable_gaussian", True))
-        stabilize_skin = bool(context.get("stabilize_skin", False))
-        debug_output_dir = context.get("debug_output_dir")
+        color_boost = float(context.get("color_boost", self.options.get("color_boost", 1.1)))
 
+        # ── 1. Run model ─────────────────────────────────────────────────────
         with torch.inference_mode():
             with _autocast_context(self.device, self.amp_enabled):
-                ab_pred = self.model(x).squeeze(0).permute(1, 2, 0).float().cpu().numpy()
+                ab_pred = self.model(x)   # output: [1, 2, H, W], range [-1, 1]
 
-        # Post-process AB channels for quality improvement
-        if enable_postprocess:
-            ab_processed, pp_stats = postprocess_ab_channels(
-                ab_pred,
-                ab_scale=ab_clip,
-                ab_clip=ab_clip,
-                enable_bilateral=enable_bilateral,
-                enable_gaussian=enable_gaussian,
-                stabilize_skin=stabilize_skin,
-            )
-            print(f"[Colorizer] Post-processing stats:")
-            print(f"  Mean chroma: {pp_stats['mean_chroma_raw']:.3f} → {pp_stats['mean_chroma_processed']:.3f}")
-            print(f"  AB range: [{pp_stats['ab_min_raw']:.1f}, {pp_stats['ab_max_raw']:.1f}] → [{pp_stats['ab_min_processed']:.1f}, {pp_stats['ab_max_processed']:.1f}]")
-        else:
-            ab_processed = np.clip(ab_pred, -1.0, 1.0) * ab_clip
+        # ── 2. Convert to numpy [H, W, 2] ────────────────────────────────────
+        ab_np = ab_pred.squeeze(0).permute(1, 2, 0).float().cpu().numpy()
 
-        # Apply adaptive color boost
-        mean_chroma_before = float(np.sqrt(np.mean(ab_processed[:, :, 0] ** 2 + ab_processed[:, :, 1] ** 2)))
-        adaptive_boost = color_boost
-        if mean_chroma_before < 15.0:
-            adaptive_boost = color_boost * 1.8
-        elif mean_chroma_before < 25.0:
-            adaptive_boost = color_boost * 1.3
-        
-        # Apply more sophisticated adaptive boosting with skin tone correction
-        mean_chroma_processed = float(np.sqrt(np.mean(ab_processed[:, :, 0] ** 2 + ab_processed[:, :, 1] ** 2)))
-        
-        # Skin tone correction: reduce red and yellow for natural appearance
-        ab_skin_corrected = ab_processed.copy()
-        ab_skin_corrected[:, :, 0] *= 0.85  # Reduce A channel (red-green)
-        ab_skin_corrected[:, :, 1] *= 0.95  # Reduce B channel (yellow-blue)
-        
-        # Adaptive boost: stronger boost for undersaturated images
-        adaptive_boost = np.clip(1.2 - mean_chroma_processed / 100.0, 0.8, 1.2)
-        adaptive_boost *= color_boost
-        
-        ab_boosted = ab_skin_corrected * adaptive_boost
-        ab_boosted = np.clip(ab_boosted, -100.0, 100.0)  # Safe LAB range
+        # ── 3. CRITICAL: scale from [-1,1] to [-128,128] ──────────────────────
+        # This is the most important line. Model tanh output must be scaled.
+        ab_128 = np.clip(ab_np, -1.0, 1.0) * 128.0
 
-        # Convert LAB → RGB with safe handling
-        rgb = safe_lab_to_rgb(l_np, ab_boosted)
+        # ── 4. Apply colour boost ─────────────────────────────────────────────
+        ab_128 = ab_128 * color_boost
+        print(f"[Colorizer] AB after boost: [{ab_128.min():.1f}, {ab_128.max():.1f}]")
 
-        # Debug output: save intermediate results
-        if debug_output_dir:
-            try:
-                debug_dir = Path(debug_output_dir)
-                debug_dir.mkdir(parents=True, exist_ok=True)
-                
-                # Save raw colorization (before smoothing)
-                rgb_raw = safe_lab_to_rgb(l_np, np.clip(ab_processed, -ab_clip, ab_clip))
-                raw_path = debug_dir / "01_stage1_raw.jpg"
-                rgb_u8 = np.clip(rgb_raw * 255.0, 0.0, 255.0).astype(np.uint8)
-                Image.fromarray(rgb_u8).save(raw_path, format="JPEG", quality=95)
-                print(f"[Debug] Saved raw output: {raw_path}")
-            except Exception as e:
-                print(f"[Debug] Warning: Failed to save intermediate outputs: {e}")
+        # ── 5. Semantic correction (sky blue, water blue, vegetation green) ───
+        H, W = l_np.shape
+        l_uint8 = (l_np * 255).astype(np.uint8)
+        blur    = cv2.GaussianBlur(l_uint8, (21, 21), 0).astype(np.float32) / 255.0
+        texture = np.abs(l_np - blur)
 
-        rgb_tensor = torch.from_numpy(rgb).permute(2, 0, 1).unsqueeze(0).float().to(self.device)
+        # Sky: top 45%, bright, smooth — push toward blue
+        sky = np.zeros((H, W), bool)
+        sky[:int(H * 0.45), :] = True
+        sky &= (l_np > 0.50) & (texture < 0.08)
+        sky_needs_blue = sky & (ab_128[:, :, 1] < 20.0)
+        blend = 0.70
+        ab_128[sky_needs_blue, 0] = (1-blend)*ab_128[sky_needs_blue,0] + blend*(-5.0)
+        ab_128[sky_needs_blue, 1] = (1-blend)*ab_128[sky_needs_blue,1] + blend*(45.0)
+        print(f"[Colorizer] Sky correction: {sky_needs_blue.sum()} pixels boosted to blue")
+
+        # Water: lower half, mid-bright, smooth
+        wat = np.zeros((H, W), bool)
+        wat[int(H * 0.25):, :] = True
+        wat &= (l_np > 0.28) & (l_np < 0.72) & (texture < 0.025)
+        wat_needs_blue = wat & (ab_128[:, :, 1] < 10.0)
+        blend = 0.80
+        ab_128[wat_needs_blue, 0] = (1-blend)*ab_128[wat_needs_blue,0] + blend*(-8.0)
+        ab_128[wat_needs_blue, 1] = (1-blend)*ab_128[wat_needs_blue,1] + blend*(35.0)
+        print(f"[Colorizer] Water correction: {wat_needs_blue.sum()} pixels boosted to blue")
+
+        # Vegetation: model hints green, reinforce
+        veg = (l_np > 0.15) & (l_np < 0.60) & (ab_128[:, :, 0] < -2.0)
+        blend_v = 0.40
+        ab_128[veg, 0] = (1-blend_v)*ab_128[veg,0] + blend_v*(-22.0)
+        ab_128[veg, 1] = (1-blend_v)*ab_128[veg,1] + blend_v*(-8.0)
+        print(f"[Colorizer] Vegetation correction: {veg.sum()} pixels reinforced to green")
+
+        # Shadows: desaturate very dark areas
+        ab_128[l_np < 0.08, :] *= 0.3
+        print(f"[Colorizer] Shadows desaturated (dark regions)")
+
+        # ── 6. Edge-aware bilateral filter — reduce colour bleeding ───────────
+        def bilateral(ch):
+            u8 = np.clip((ch + 128) / 256 * 255, 0, 255).astype(np.uint8)
+            f  = cv2.bilateralFilter(u8, d=9, sigmaColor=18, sigmaSpace=18)
+            return f.astype(np.float32) / 255 * 256 - 128
+
+        ab_128[:, :, 0] = bilateral(ab_128[:, :, 0])
+        ab_128[:, :, 1] = bilateral(ab_128[:, :, 1])
+        print(f"[Colorizer] Bilateral filter applied")
+
+        # ── 7. Clip AB to valid range ─────────────────────────────────────────
+        ab_128 = np.clip(ab_128, -110.0, 110.0)
+        print(f"[Colorizer] AB clipped to [-110, 110]: [{ab_128.min():.1f}, {ab_128.max():.1f}]")
+
+        # ── 8. Reconstruct LAB image ──────────────────────────────────────────
+        lab = np.zeros((H, W, 3), dtype=np.float32)
+        lab[:, :, 0] = l_np * 100.0    # L: [0, 100]
+        lab[:, :, 1] = ab_128[:, :, 0] # A: [-110, 110]
+        lab[:, :, 2] = ab_128[:, :, 1] # B: [-110, 110]
+
+        # ── 9. LAB → RGB ──────────────────────────────────────────────────────
+        rgb = np.clip(lab2rgb(lab), 0.0, 1.0)
+        print(f"[Colorizer] LAB → RGB conversion complete")
+
+        # ── 10. Convert to tensor and return ──────────────────────────────────
+        rgb_tensor = (torch.from_numpy(rgb)
+                      .permute(2, 0, 1)
+                      .unsqueeze(0)
+                      .float()
+                      .to(self.device))
+        print(f"[Colorizer] Output tensor shape: {rgb_tensor.shape}")
         return rgb_tensor
 
 
@@ -294,29 +310,51 @@ class SRStage(PipelineStage):
 
     def run(self, x: torch.Tensor, **kwargs) -> torch.Tensor:
         if self.model is None:
-            print(f"[{self.stage_name}] Model not loaded, skipping (identity pass)")
-            return x
-        
-        context = kwargs.get("context", {})
-        max_size = int(context.get("max_size", 512))
-        
-        print(f"[{self.stage_name}] Input shape: {x.shape}, dtype: {x.dtype}, device: {x.device}")
-        
-        # Limit resolution to avoid excessive computation (BIG SPEED FIX)
-        x_limited = limit_resolution(x, max_size=max_size)
-        
-        try:
-            with torch.inference_mode():
-                with _autocast_context(self.device, self.amp_enabled):
-                    out = self.model(x_limited)
-            
-            result = torch.clamp(out, 0.0, 1.0)
-            print(f"[{self.stage_name}] Output shape: {result.shape}, dtype: {result.dtype}")
-            return result
-        except Exception as e:
-            print(f"[Error] {self.stage_name} inference failed: {e}")
-            print(f"[Fallback] {self.stage_name} returning input unchanged")
-            return x
+            # No checkpoint: bicubic upsample to maintain pipeline flow
+            return torch.nn.functional.interpolate(
+                x, scale_factor=4, mode="bicubic", align_corners=False
+            ).clamp(0.0, 1.0)
+
+        with torch.inference_mode():
+            with _autocast_context(self.device, self.amp_enabled):
+                sr_out = self.model(x)
+
+        sr_out = torch.clamp(sr_out, 0.0, 1.0)
+
+        # ── Colour preservation ──────────────────────────────────────────────
+        # SR model may have been trained on greyscale and lose colour.
+        # Detect if output lost colour vs input and restore if so.
+        import torch.nn.functional as F
+
+        sr_h, sr_w = sr_out.shape[-2], sr_out.shape[-1]
+
+        # Upscale input to SR output size for comparison
+        x_up = F.interpolate(
+            x, size=(sr_h, sr_w), mode="bicubic", align_corners=False
+        ).clamp(0.0, 1.0)
+
+        # Measure colour strength in SR output vs input
+        def chroma(t):
+            # Simple colour signal: std across channels
+            return t.std(dim=1, keepdim=True).mean().item()
+
+        sr_chroma    = chroma(sr_out)
+        input_chroma = chroma(x_up)
+
+        print(f"[SR] Input chroma: {input_chroma:.4f}, SR output chroma: {sr_chroma:.4f}")
+
+        if sr_chroma < 0.3 * input_chroma:
+            # SR lost >70% of colour signal — blend to restore
+            print("[SR] Colour loss detected — applying colour preservation blend")
+            # Extract luminance from SR (sharp detail), colour from input (vivid)
+            # Blend: SR provides sharpness, upscaled input provides colour
+            sr_out = 0.5 * sr_out + 0.5 * x_up
+            sr_out = torch.clamp(sr_out, 0.0, 1.0)
+            print(f"[SR] After blend chroma: {chroma(sr_out):.4f}")
+        else:
+            print("[SR] Colour preserved correctly — no blend needed")
+
+        return sr_out
 
 
 class DepthStage(PipelineStage):
@@ -794,6 +832,137 @@ def apply_color_histogram_normalization(rgb: np.ndarray, clip_limit: float = 2.0
         return np.clip(out_rgb, 0.0, 1.0)
     except Exception:
         return rgb
+
+
+def semantic_color_correction(rgb: np.ndarray, enable_sky_boost: bool = True, enable_water_boost: bool = True, skin_mask: Optional[np.ndarray] = None) -> np.ndarray:
+    """
+    Apply SUBTLE semantic-aware color correction to enhance realism.
+    
+    Subtle enhancements (NEVER aggressive):
+    - SKY: Small blue boost (+5 to +10 max in LAB B channel)
+    - WATER: Slight blue-green shift (minimal delta only)
+    - SKIN PROTECTION: Exclude skin pixels from all corrections
+    
+    Args:
+        rgb: RGB image in range [0, 1] with shape (H, W, 3)
+        enable_sky_boost: Enable subtle sky blue enhancement
+        enable_water_boost: Enable subtle water blue-green enhancement
+        skin_mask: Optional boolean mask (H, W) where True indicates skin pixels to protect
+    
+    Returns:
+        Color-corrected RGB image in range [0, 1]
+    """
+    # Early return if all corrections are disabled
+    if not enable_sky_boost and not enable_water_boost:
+        return rgb
+    
+    if cv2 is None:
+        return rgb
+    
+    try:
+        # Convert RGB [0, 1] to LAB for direct AB channel manipulation
+        rgb_u8 = np.clip(rgb * 255.0, 0.0, 255.0).astype(np.uint8)
+        bgr_u8 = cv2.cvtColor(rgb_u8, cv2.COLOR_RGB2BGR)
+        lab_u8 = cv2.cvtColor(bgr_u8, cv2.COLOR_BGR2LAB)
+        
+        # Split into L, A, B channels
+        l_channel = lab_u8[:, :, 0].astype(np.float32)
+        a_channel = lab_u8[:, :, 1].astype(np.float32)
+        b_channel = lab_u8[:, :, 2].astype(np.float32)
+        
+        height, width = l_channel.shape
+        
+        # ========== SKY DETECTION & SUBTLE BLUE BOOST ==========
+        if enable_sky_boost:
+            # Top 30% of image - typically sky region
+            sky_region_pct = int(0.3 * height)
+            
+            # Heuristic: low saturation + high brightness = likely sky
+            # In OpenCV LAB: A and B are centered at 128, range [0, 255]
+            a_centered = a_channel[:sky_region_pct, :] - 128.0
+            b_centered = b_channel[:sky_region_pct, :] - 128.0
+            chroma = np.sqrt(a_centered ** 2 + b_centered ** 2)
+            
+            # Low saturation + high brightness = likely sky
+            sky_mask = (chroma < 40) & (l_channel[:sky_region_pct, :] > 100)
+            
+            # Exclude skin pixels from sky corrections if mask provided
+            if skin_mask is not None:
+                sky_mask = sky_mask & ~skin_mask[:sky_region_pct, :]
+            
+            # SUBTLE blue boost: only +5 to +10 max, NOT aggressive
+            # Boost only pixels that need it (yellowed sky)
+            current_b = b_channel[:sky_region_pct, :]
+            delta_b = np.maximum(0, (135 - current_b) * 0.05)  # Subtle: scale by 0.05
+            delta_b = np.clip(delta_b, 0, 8)  # Hard limit: +8 max in LAB space
+            
+            # Apply subtle correction only to detected sky pixels
+            b_channel[:sky_region_pct, :][sky_mask] += delta_b[sky_mask]
+            
+            sky_pixels = np.sum(sky_mask)
+            avg_delta_b = np.mean(delta_b[sky_mask]) if sky_pixels > 0 else 0.0
+            print(f"[Semantic] Sky: {sky_pixels} pixels, subtle blue delta: {avg_delta_b:.2f}")
+        
+        # ========== WATER DETECTION & SUBTLE BLUE-GREEN SHIFT ==========
+        if enable_water_boost:
+            # Bottom 50% of image - typically water/ground region
+            water_region_start = int(0.5 * height)
+            
+            # In OpenCV LAB: A and B are centered at 128
+            a_centered = a_channel[water_region_start:, :] - 128.0
+            b_centered = b_channel[water_region_start:, :] - 128.0
+            chroma = np.sqrt(a_centered ** 2 + b_centered ** 2)
+            
+            # Medium saturation + decent brightness = likely water/ground
+            water_mask = (chroma > 10) & (chroma < 80) & (l_channel[water_region_start:, :] > 60)
+            
+            # Exclude skin pixels from water corrections if mask provided
+            if skin_mask is not None:
+                water_mask = water_mask & ~skin_mask[water_region_start:, :]
+            
+            # SUBTLE blue-green shift: minimal delta only
+            # Only enhance if water looks too greenish (high A values)
+            current_b_water = b_channel[water_region_start:, :]
+            delta_b_water = np.maximum(0, (140 - current_b_water) * 0.02)  # Very subtle: scale by 0.02
+            delta_b_water = np.clip(delta_b_water, 0, 5)  # Hard limit: +5 max
+            
+            # Subtle cyan shift: only reduce redness slightly
+            delta_a_water = -np.abs(a_centered) * 0.02  # Very subtle: 2% reduction only
+            delta_a_water = np.clip(delta_a_water, -3, 0)  # Hard limit: -3 max
+            
+            # Apply subtle corrections to detected water pixels
+            b_channel[water_region_start:, :][water_mask] += delta_b_water[water_mask]
+            a_channel[water_region_start:, :][water_mask] += delta_a_water[water_mask]
+            
+            water_pixels = np.sum(water_mask)
+            avg_delta_b = np.mean(delta_b_water[water_mask]) if water_pixels > 0 else 0.0
+            avg_delta_a = np.mean(delta_a_water[water_mask]) if water_pixels > 0 else 0.0
+            print(f"[Semantic] Water: {water_pixels} pixels, subtle blue delta: {avg_delta_b:.2f}, red delta: {avg_delta_a:.2f}")
+        
+        # ========== CLAMP & RECONSTRUCT LAB → RGB ==========
+        # Clamp AB channels to valid LAB range (accounting for center offset)
+        a_channel = np.clip(a_channel, 0, 255)
+        b_channel = np.clip(b_channel, 0, 255)
+        l_channel = np.clip(l_channel, 0, 255)
+        
+        # Merge back to LAB
+        lab_corrected = np.stack([
+            l_channel.astype(np.uint8),
+            a_channel.astype(np.uint8),
+            b_channel.astype(np.uint8)
+        ], axis=2)
+        
+        # Convert LAB → BGR → RGB
+        bgr_corrected = cv2.cvtColor(lab_corrected, cv2.COLOR_LAB2BGR)
+        rgb_corrected = cv2.cvtColor(bgr_corrected, cv2.COLOR_BGR2RGB)
+        
+        return rgb_corrected.astype(np.float32) / 255.0
+    
+    except Exception as e:
+        print(f"[Warning] Semantic color correction failed: {e}")
+        return rgb
+
+
 
 
 def compute_colorization_quality_score(rgb: np.ndarray) -> Dict[str, Any]:
