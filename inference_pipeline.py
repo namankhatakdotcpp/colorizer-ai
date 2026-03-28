@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import gc
+import glob
 import time
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
@@ -586,8 +587,20 @@ class GANRefinementStage(PipelineStage):
             Refined tensor (B, C, H, W) with values in [0, 1]
         """
         if self.model is None:
-            print(f"[{self.stage_name}] Model not loaded, skipping GAN refinement")
-            return x
+            # Try to auto-load latest GAN checkpoint
+            ckpts = sorted(glob.glob("checkpoints/stage5_gan/*.pth"))
+            if ckpts:
+                latest = ckpts[-1]
+                print(f"[GAN] Auto-loading: {latest}")
+                try:
+                    self.model.load_state_dict(torch.load(latest, map_location=self.device))
+                except Exception as load_err:
+                    print(f"[GAN] Failed to auto-load checkpoint: {load_err}")
+                    print(f"[{self.stage_name}] Model not loaded, skipping GAN refinement")
+                    return x
+            else:
+                print(f"[{self.stage_name}] Model not loaded, skipping GAN refinement")
+                return x
         
         try:
             # Convert from [0, 1] to [-1, 1] for generator
@@ -694,9 +707,14 @@ class ModularInferencePipeline:
             try:
                 stage.load()
                 x_before_shape = x.shape
-                x = stage.run(x, context=context)
-                x_after_shape = x.shape
-                print(f"[Pipeline] {stage.stage_name} complete: {x_before_shape} → {x_after_shape}")
+                out = stage.run(x, context=context)
+                
+                if out is None:
+                    print(f"[WARNING] {stage.stage_name} returned None, skipping...")
+                else:
+                    x = out
+                    x_after_shape = x.shape
+                    print(f"[Pipeline] {stage.stage_name} complete: {x_before_shape} → {x_after_shape}")
                 stage.unload()
             except Exception as e:
                 print(f"[Error] Pipeline error at stage {stage.stage_name}: {e}")
