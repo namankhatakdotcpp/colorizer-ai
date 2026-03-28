@@ -1,0 +1,37 @@
+2026-03-29 02:39:43,991 - __main__ - INFO - Installing required dependencies...
+2026-03-29 02:39:43,991 - __main__ - INFO - Installing torch...
+2026-03-29 02:39:44,805 - __main__ - INFO - ✓ torch installed
+2026-03-29 02:39:44,806 - __main__ - INFO - Installing torchvision...
+2026-03-29 02:39:45,057 - __main__ - INFO - ✓ torchvision installed
+2026-03-29 02:39:45,058 - __main__ - INFO - Installing tqdm...
+2026-03-29 02:39:45,321 - __main__ - INFO - ✓ tqdm installed
+2026-03-29 02:39:45,321 - __main__ - INFO - Installing opencv-python...
+2026-03-29 02:39:45,557 - __main__ - INFO - ✓ opencv-python installed
+2026-03-29 02:39:45,557 - __main__ - INFO - Installing pytorch-fid...
+2026-03-29 02:39:46,836 - __main__ - INFO - ✓ pytorch-fid installed
+2026-03-29 02:39:46,836 - __main__ - INFO - Installing scikit-image...
+2026-03-29 02:39:47,060 - __main__ - INFO - ✓ scikit-image installed
+2026-03-29 02:39:47,060 - __main__ - INFO - Dependencies installation complete
+2026-03-29 02:39:47,061 - __main__ - INFO - Initialized DatasetPreparator
+2026-03-29 02:39:47,061 - __main__ - INFO - Input directory: dataset/images
+2026-03-29 02:39:47,061 - __main__ - INFO - Output base directory: data
+2026-03-29 02:39:47,061 - __main__ - INFO - Resize size: 256x256
+2026-03-29 02:39:47,061 - __main__ - INFO - ============================================================
+2026-03-29 02:39:47,061 - __main__ - INFO - STARTING DATASET PREPARATION
+2026-03-29 02:39:47,061 - __main__ - INFO - ============================================================
+2026-03-29 02:39:47,061 - __main__ - ERROR - Input directory does not exist: dataset/images
+2026-03-29 02:39:47,061 - __main__ - ERROR - Input validation failed
+2026-03-29 02:39:47,061 - __main__ - INFO - ============================================================
+2026-03-29 02:39:47,061 - __main__ - INFO - DATASET PREPARATION SUMMARY
+2026-03-29 02:39:47,061 - __main__ - INFO - ============================================================
+2026-03-29 02:39:47,061 - __main__ - INFO - Total images processed: 0
+2026-03-29 02:39:47,061 - __main__ - INFO - Successfully processed: 0
+2026-03-29 02:39:47,061 - __main__ - INFO - Failed images: 0
+2026-03-29 02:39:47,061 - __main__ - INFO - Inference success: 0
+2026-03-29 02:39:47,061 - __main__ - INFO - Inference fallback (grayscale): 0
+2026-03-29 02:39:47,061 - __main__ - INFO - ============================================================
+2026-03-29 02:39:47,061 - __main__ - INFO - Output directory: data
+2026-03-29 02:39:47,061 - __main__ - INFO - Colorized dir: data/colorized
+2026-03-29 02:39:47,061 - __main__ - INFO - Ground truth dir: data/ground_truth
+2026-03-29 02:39:47,061 - __main__ - INFO - ============================================================
+2026-03-29 02:39:47,061 - __main__ - ERROR - Dataset preparation failed!
