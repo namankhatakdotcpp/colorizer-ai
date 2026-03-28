@@ -287,11 +287,12 @@ class DatasetPreparator:
             True if successful, False otherwise
         """
         try:
-            image_stem = image_path.stem
+            # Use original filename for both directories (ensures exact matching)
+            filename_with_ext = image_path.stem + ".png"
 
-            # Paths
-            ground_truth_path = self.ground_truth_dir / f"{image_stem}_gt.jpg"
-            colorized_path = self.colorized_dir / f"{image_stem}_colorized.jpg"
+            # Paths - both use the SAME filename
+            ground_truth_path = self.ground_truth_dir / filename_with_ext
+            colorized_path = self.colorized_dir / filename_with_ext
 
             # Step 1: Save ground truth
             if not self.save_ground_truth(image_path, ground_truth_path):
@@ -306,8 +307,8 @@ class DatasetPreparator:
                 self.stats["failed_images"] += 1
                 return False
 
-            # Step 3: Save temporary grayscale for inference
-            temp_grayscale_path = self.colorized_dir / f"{image_stem}_temp_gray.jpg"
+            # Step 3: Save temporary grayscale for inference (temp file, will be deleted)
+            temp_grayscale_path = self.colorized_dir / f".temp_{image_path.stem}.jpg"
             cv2.imwrite(str(temp_grayscale_path), grayscale_image)
 
             # Step 4: Try to run inference

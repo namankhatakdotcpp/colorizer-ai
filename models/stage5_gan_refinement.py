@@ -12,7 +12,7 @@ from typing import Optional, Tuple
 import cv2
 import numpy as np
 import torch
-
+import torchvision
 from models.gan_generator import GANGenerator
 
 
