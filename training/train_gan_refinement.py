@@ -11,7 +11,7 @@ import logging
 import os
 from pathlib import Path
 from typing import Dict, Tuple, Optional
-
+import torchvision
 import torch
 import torch.nn as nn
 import torch.optim as optim

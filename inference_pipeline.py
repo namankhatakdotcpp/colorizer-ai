@@ -25,13 +25,14 @@ except Exception as exc:  # pragma: no cover
 
 from models.dfn_bokeh import DFNBokehModel
 from models.depth_model import DynamicFilterNetwork
+from models.gan_generator import GANGenerator
 from models.micro_contrast_model import MicroContrastModel
 from models.rrdb_sr import RRDBNet
 from models.unet_colorizer import UNetColorizer
 from models.zero_dce import ZeroDCEModel
 
 
-DEFAULT_PIPELINE_STAGES = ["colorizer", "sr", "depth", "bokeh", "tone", "contrast", "sharpen", "normalize"]
+DEFAULT_PIPELINE_STAGES = ["colorizer", "sr", "depth", "bokeh", "tone", "contrast", "gan", "sharpen", "normalize"]
 
 
 def _autocast_context(device: torch.device, enabled: bool):
@@ -559,6 +560,54 @@ class NormalizeStage(PipelineStage):
             return x
 
 
+class GANRefinementStage(PipelineStage):
+    """Stage 5: GAN-based image refinement for improved perceptual quality."""
+    stage_name = "gan"
+    checkpoint_name = None  # Will be resolved from checkpoint_map
+    required = False
+
+    def build_model(self) -> torch.nn.Module:
+        """Build GAN generator model."""
+        return GANGenerator(
+            in_channels=3,
+            out_channels=3,
+            base_filters=64,
+            num_residual_blocks=4,
+        )
+
+    def run(self, x: torch.Tensor, **kwargs) -> torch.Tensor:
+        """
+        Apply GAN refinement to image.
+        
+        Args:
+            x: Input tensor (B, C, H, W) with values in [0, 1]
+            
+        Returns:
+            Refined tensor (B, C, H, W) with values in [0, 1]
+        """
+        if self.model is None:
+            print(f"[{self.stage_name}] Model not loaded, skipping GAN refinement")
+            return x
+        
+        try:
+            # Convert from [0, 1] to [-1, 1] for generator
+            x_normalized = x * 2.0 - 1.0
+            
+            with torch.no_grad():
+                with _autocast_context(self.device, self.amp_enabled):
+                    output = self.model(x_normalized)
+            
+            # Convert from [-1, 1] back to [0, 1]
+            output = torch.clamp((output + 1.0) / 2.0, 0.0, 1.0)
+            
+            print(f"[{self.stage_name}] GAN refinement applied successfully")
+            return output
+            
+        except Exception as e:
+            print(f"[Warning] {self.stage_name} failed: {e}, returning input unchanged")
+            return x
+
+
 STAGE_REGISTRY = {
     "colorizer": ColorizerStage,
     "sr": SRStage,
@@ -566,6 +615,7 @@ STAGE_REGISTRY = {
     "bokeh": BokehStage,
     "tone": ToneStage,
     "contrast": ContrastStage,
+    "gan": GANRefinementStage,
     "sharpen": SharpenStage,
     "normalize": NormalizeStage,
 }
