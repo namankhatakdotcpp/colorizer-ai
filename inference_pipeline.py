@@ -508,6 +508,10 @@ class SharpenStage(PipelineStage):
         return None
 
     def run(self, x: torch.Tensor, **kwargs) -> torch.Tensor:
+        if x is None:
+            print(f"[{self.stage_name}] Input is None, returning as-is")
+            return x
+            
         context = kwargs.get("context", {})
         enable_sharpening = bool(context.get("enable_sharpening", True))
         
@@ -522,6 +526,10 @@ class SharpenStage(PipelineStage):
             sigma = float(context.get("sharpen_sigma", 1.0))
             x_sharpened = apply_unsharp_mask(x_np, strength=strength, sigma=sigma)
             
+            if x_sharpened is None:
+                print(f"[Warning] {self.stage_name} unsharp_mask returned None")
+                return x
+                
             result = torch.from_numpy(x_sharpened).permute(2, 0, 1).unsqueeze(0).float().to(self.device)
             print(f"[{self.stage_name}] Output shape: {result.shape}")
             return result
@@ -540,6 +548,10 @@ class NormalizeStage(PipelineStage):
         return None
 
     def run(self, x: torch.Tensor, **kwargs) -> torch.Tensor:
+        if x is None:
+            print(f"[{self.stage_name}] Input is None, returning as-is")
+            return x
+            
         context = kwargs.get("context", {})
         enable_normalize = bool(context.get("enable_normalize", True))
         
@@ -553,6 +565,10 @@ class NormalizeStage(PipelineStage):
             clip_limit = float(context.get("clip_limit", 2.0))
             x_normalized = apply_histogram_equalization(x_np, clip_limit=clip_limit)
             
+            if x_normalized is None:
+                print(f"[Warning] {self.stage_name} histogram_equalization returned None")
+                return x
+                
             result = torch.from_numpy(x_normalized).permute(2, 0, 1).unsqueeze(0).float().to(self.device)
             print(f"[{self.stage_name}] Output shape: {result.shape}")
             return result
