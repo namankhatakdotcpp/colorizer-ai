@@ -40,3 +40,6 @@ verify_*.py
 test_semantic*.py
 test_skin*.py
 test_ml*.py
+outputs/
+__pycache__/
+*.pth
