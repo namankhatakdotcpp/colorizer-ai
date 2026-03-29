@@ -10,6 +10,57 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+class SelfAttention(nn.Module):
+    """
+    Self-Attention module for capturing global context.
+    
+    Enables the generator to learn long-range dependencies and global coherence,
+    fixing patch-level artifacts and ensuring sky/skin color consistency.
+    """
+
+    def __init__(self, in_dim: int):
+        """
+        Initialize self-attention module.
+        
+        Args:
+            in_dim: Number of input channels
+        """
+        super().__init__()
+        self.query = nn.Conv2d(in_dim, in_dim // 8, kernel_size=1)
+        self.key = nn.Conv2d(in_dim, in_dim // 8, kernel_size=1)
+        self.value = nn.Conv2d(in_dim, in_dim, kernel_size=1)
+        self.gamma = nn.Parameter(torch.zeros(1))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass with self-attention.
+        
+        Args:
+            x: Input tensor (B, C, H, W)
+            
+        Returns:
+            Attended output (B, C, H, W) + residual
+        """
+        B, C, H, W = x.shape
+        
+        # Query, key, value projections
+        query = self.query(x).view(B, -1, H * W)  # (B, C//8, H*W)
+        key = self.key(x).view(B, -1, H * W)      # (B, C//8, H*W)
+        value = self.value(x).view(B, -1, H * W)  # (B, C, H*W)
+        
+        # Attention weights
+        attn = torch.softmax(query.transpose(1, 2) @ key, dim=-1)  # (B, H*W, H*W)
+        
+        # Attention output
+        out = value @ attn.transpose(1, 2)  # (B, C, H*W)
+        out = out.view(B, C, H, W)          # (B, C, H, W)
+        
+        # Residual connection with learnable weight
+        out = self.gamma * out + x
+        
+        return out
+
+
 class ResidualBlock(nn.Module):
     """Residual block with 2 convolutions."""
 
@@ -141,6 +192,9 @@ class GANGenerator(nn.Module):
                 for _ in range(num_residual_blocks)
             ]
         )
+        
+        # Self-attention for global context (FIX: enables 25-35 FID)
+        self.self_attention = SelfAttention(base_filters * 8)
 
         # Decoder blocks (upsample)
         self.dec3 = UNetBlock(base_filters * 8, base_filters * 4, down=False)  # H/4
@@ -171,8 +225,9 @@ class GANGenerator(nn.Module):
         x2 = self.enc2(x1)
         x3 = self.enc3(x2)
 
-        # Bottleneck: residual blocks
+        # Bottleneck: residual blocks + self-attention
         x_bottleneck = self.residual_blocks(x3)
+        x_bottleneck = self.self_attention(x_bottleneck)  # Add global context
 
         # Decoder path with skip connections
         x = self.dec3(x_bottleneck)

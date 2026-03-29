@@ -3,10 +3,13 @@ PatchGAN Discriminator for image refinement adversarial training.
 
 Classifies patches of images as real or generated to provide feedback
 to the generator during training.
+
+Uses Spectral Normalization to stabilize training.
 """
 
 import torch
 import torch.nn as nn
+from torch.nn.utils import spectral_norm
 
 
 class PatchGANDiscriminator(nn.Module):
@@ -40,7 +43,7 @@ class PatchGANDiscriminator(nn.Module):
         self.num_layers = num_layers
         self.patch_size = patch_size
 
-        # Build discriminator layers
+        # Build discriminator layers with Spectral Normalization
         layers = []
         in_channels_current = in_channels
 
@@ -48,30 +51,30 @@ class PatchGANDiscriminator(nn.Module):
             out_channels = base_filters * min(2 ** i, 8)
 
             if i == 0:
-                # First layer: no normalization
+                # First layer: no normalization, but with spectral norm
                 layers.extend([
-                    nn.Conv2d(in_channels_current, out_channels, 4, stride=2, padding=1),
+                    spectral_norm(nn.Conv2d(in_channels_current, out_channels, 4, stride=2, padding=1)),
                     nn.LeakyReLU(0.2, inplace=True),
                 ])
             elif i == num_layers - 1:
-                # Last layer: stride=1
+                # Last layer: stride=1 with spectral norm
                 layers.extend([
-                    nn.Conv2d(in_channels_current, out_channels, 4, stride=1, padding=1),
+                    spectral_norm(nn.Conv2d(in_channels_current, out_channels, 4, stride=1, padding=1)),
                     nn.InstanceNorm2d(out_channels, affine=True),
                     nn.LeakyReLU(0.2, inplace=True),
                 ])
             else:
-                # Middle layers: stride=2, normalization
+                # Middle layers: stride=2, normalization, spectral norm
                 layers.extend([
-                    nn.Conv2d(in_channels_current, out_channels, 4, stride=2, padding=1),
+                    spectral_norm(nn.Conv2d(in_channels_current, out_channels, 4, stride=2, padding=1)),
                     nn.InstanceNorm2d(out_channels, affine=True),
                     nn.LeakyReLU(0.2, inplace=True),
                 ])
 
             in_channels_current = out_channels
 
-        # Final output layer: single channel (real/fake classification)
-        layers.append(nn.Conv2d(in_channels_current, 1, 4, stride=1, padding=1))
+        # Final output layer: single channel with spectral norm
+        layers.append(spectral_norm(nn.Conv2d(in_channels_current, 1, 4, stride=1, padding=1)))
 
         self.layers = nn.Sequential(*layers)
 
@@ -105,25 +108,27 @@ class PatchGANDiscriminator(nn.Module):
 
 class MultiscaleDiscriminator(nn.Module):
     """
-    Multi-scale discriminator for improved stability and detail perception.
+    Multi-scale conditional discriminator for improved stability and detail perception.
 
-    Operates on multiple scales to capture both global structure
-    and fine details.
+    Operates on multiple scales to capture both global structure and fine details.
+    Accepts concatenated input: [original_color, grayscale, refined_color] or similar.
+    
+    FIX: Conditional input prevents unrealistic color hallucination.
     """
 
     def __init__(
         self,
-        in_channels: int = 3,
+        in_channels: int = 4,  # UPDATED: 4 channels for conditional GAN (gray + RGB)
         base_filters: int = 64,
         num_scales: int = 3,
     ):
         """
-        Initialize multi-scale discriminator.
+        Initialize multi-scale conditional discriminator.
 
         Args:
-            in_channels: Number of input channels
+            in_channels: Number of input channels (4 for conditional: grayscale + RGB)
             base_filters: Base number of filters
-            num_scales: Number of scales to process
+            num_scales: Number of scales to process (original, ÷2, ÷4)
         """
         super().__init__()
 
