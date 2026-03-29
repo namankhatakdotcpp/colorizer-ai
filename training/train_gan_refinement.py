@@ -527,8 +527,12 @@ class GANRefinementTrainer:
             loss_fft = fft_loss(refined, target)
 
             # ========== FRESH D FORWARD PASSES ==========
-            # These are NEW computations, not reused from D step
-            refined_conditional = torch.cat([L_expanded, refined], dim=1)  # refined NOT detached
+            # CRITICAL: Rebuild EVERYTHING fresh - don't reuse from D step
+            # Rebuild L_expanded fresh for G step
+            L_expanded_g = L_channel.expand(batch_size, -1, -1, -1) if L_channel.dim() == 3 else L_channel
+            
+            # Rebuild refined_conditional fresh with new L_expanded_g
+            refined_conditional = torch.cat([L_expanded_g, refined], dim=1)  # refined NOT detached
             
             # Fresh D(fake) with gradients flowing back to G
             with torch.cuda.amp.autocast(enabled=self.scaler is not None):
@@ -547,8 +551,16 @@ class GANRefinementTrainer:
                 # Fresh D(real) to get real features - only for feature comparison
                 # Use no_grad since we don't need gradients through real images
                 with torch.no_grad():
+                    # 🔥 REBUILD REAL_CONDITIONAL FOR G STEP (CRITICAL FIX)
+                    # Don't reuse real_conditional from D step - it's part of freed graph
+                    real_noisy_g = target + 0.05 * torch.randn_like(target)
+                    real_noisy_g = torch.clamp(real_noisy_g, -1.0, 1.0)
+                    
+                    # Fresh real_conditional with fresh L_expanded and real_noisy
+                    real_conditional_g = torch.cat([L_expanded_g, real_noisy_g], dim=1)
+                    
                     with torch.cuda.amp.autocast(enabled=self.scaler is not None):
-                        disc_real_fresh = self.discriminator(real_conditional)
+                        disc_real_fresh = self.discriminator(real_conditional_g)
                     real_features_fresh = disc_real_fresh[1:]  # All but first (logits)
                 
                 # Detach real features - they're already in no_grad context but be explicit
