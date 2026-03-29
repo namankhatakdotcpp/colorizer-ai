@@ -554,11 +554,13 @@ class GANRefinementTrainer:
             refined_conditional = torch.cat([L_expanded_g, refined_g], dim=1)
             
             # --------------------------------------------------------
-            # 1️⃣ ADVERSARIAL LOSS (ONLY GRAPH THAT BUILDS)
+            # 1️⃣ ADVERSARIAL LOSS (STANDARD GAN MATH)
             # --------------------------------------------------------
-            # 🔥 THIS is the ONLY discriminator forward with gradients
-            disc_fake_adv = self.discriminator(refined_conditional)
-            loss_adv_g = -torch.mean(disc_fake_adv[0])
+            # 🔥 ONLY ONE D forward in entire G step
+            disc_fake = self.discriminator(refined_conditional)[0]
+            
+            # 💯 Standard adversarial loss (no hacks, just correct math)
+            loss_adv_g = -disc_fake.mean()
 
             # --------------------------------------------------------
             # 2️⃣ FEATURE MATCHING (NO GRAPH - COMPLETELY ISOLATED)
@@ -569,14 +571,16 @@ class GANRefinementTrainer:
             # This prevents ANY graph building from interfering with adversarial loss
             with torch.no_grad():
                 # Fake features (no gradients)
-                disc_fake_fm = self.discriminator(refined_conditional)
+                # 💥 CRITICAL: Detach refined_conditional to break graph leak
+                disc_fake_fm = self.discriminator(refined_conditional.detach())
                 fake_features = disc_fake_fm[1:] if isinstance(disc_fake_fm, (list, tuple)) and len(disc_fake_fm) > 1 else []
                 
                 # Real features (no gradients)
                 real_noisy_g = target_g + 0.05 * torch.randn_like(target_g)
                 real_noisy_g = torch.clamp(real_noisy_g, -1.0, 1.0)
                 real_conditional_g = torch.cat([L_expanded_g, real_noisy_g], dim=1)
-                disc_real_fm = self.discriminator(real_conditional_g)
+                # 💥 CRITICAL: Detach real_conditional_g to break graph leak
+                disc_real_fm = self.discriminator(real_conditional_g.detach())
                 real_features = disc_real_fm[1:] if isinstance(disc_real_fm, (list, tuple)) and len(disc_real_fm) > 1 else []
                 
                 # Compute FM loss (no gradients at all)
