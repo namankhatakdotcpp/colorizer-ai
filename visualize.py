@@ -104,42 +104,40 @@ def visualize_single(sample_name: str, size: tuple = (256, 256)) -> bool:
     """
     Create comparison grid for single image.
     
-    Loads from:
-        - data/grayscale/{sample_name}
-        - data/colorized/{sample_name}
-        - outputs/{sample_name}
-        - data/ground_truth/{sample_name}
+    Simplified to load only:
+        - outputs/generated/{sample_name} (GAN refined output)
+        - data/ground_truth/{sample_name} (ground truth reference)
     
     Returns:
         True if successful
     """
     print(f"\n[Visualize] Processing: {sample_name}")
     
-    # Load images
-    input_img = load_image(f"data/grayscale/{sample_name}", size)
-    stage4 = load_image(f"data/colorized/{sample_name}", size)
-    gan = load_image(f"outputs/{sample_name}", size)
+    # Load images - simplified to only generated and ground truth
+    generated = load_image(f"outputs/generated/{sample_name}", size)
     gt = load_image(f"data/ground_truth/{sample_name}", size)
     
-    # Check if we have at least some images
-    valid_imgs = [img for img in [input_img, stage4, gan, gt] if img is not None]
-    if not valid_imgs:
-        print(f"[Visualize] Error: No valid images found for {sample_name}")
+    # Need at least generated and GT
+    if generated is None or gt is None:
+        print(f"[Visualize] Error: Missing required images for {sample_name}")
+        if generated is None:
+            print(f"           - {sample_name} not in outputs/generated/")
+        if gt is None:
+            print(f"           - {sample_name} not in data/ground_truth/")
         return False
     
-    # Create grid
-    grid = create_grid(
-        [img if img is not None else np.zeros_like(input_img or stage4 or gan or gt) 
-         for img in [input_img, stage4, gan, gt]],
-        ["Input", "Stage4", "GAN", "Ground Truth"]
-    )
+    # Create grid with only generated and ground truth
+    img_list = [generated, gt]
+    labels = ["Generated (GAN)", "Ground Truth"]
+    
+    grid = create_grid(img_list, labels, grid_width=2)
     
     if grid is None:
         return False
     
     # Save output
     os.makedirs("outputs/visuals", exist_ok=True)
-    output_path = f"outputs/visuals/{sample_name}"
+    output_path = f"outputs/visuals/comparison_{sample_name}"
     
     try:
         cv2.imwrite(output_path, grid)
