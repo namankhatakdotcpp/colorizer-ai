@@ -507,6 +507,11 @@ class GANRefinementTrainer:
             losses_dict["loss_r1"].append(loss_r1.item() if isinstance(loss_r1, torch.Tensor) else 0.0)
 
         # ============== Generator Step ==============
+        # 🔥 CRITICAL: Freeze discriminator to prevent graph overlap during G step
+        # This prevents gradients from flowing through D's forward pass into D's parameter graph
+        for p in self.discriminator.parameters():
+            p.requires_grad = False
+        
         # CRITICAL: Compute FRESH forward passes to avoid graph reuse error
         # Do NOT reuse disc_real or disc_refined from D step (they're freed after backward)
         self.optimizer_g.zero_grad()
@@ -618,6 +623,11 @@ class GANRefinementTrainer:
             self.scaler.update()
         else:
             self.optimizer_g.step()
+        
+        # 🔥 CRITICAL: Restore discriminator gradients after G step
+        # This must happen AFTER optimizer_g.step() to prevent interference
+        for p in self.discriminator.parameters():
+            p.requires_grad = True
         
         # UPDATE EMA GENERATOR (important for eval) 
         with torch.no_grad():
