@@ -598,7 +598,7 @@ class GANRefinementTrainer:
         print(f"target_g.requires_grad: {target_g.requires_grad}")
         print(f"colorized_g.requires_grad: {colorized_g.requires_grad}")
         print(f"loss_g.requires_grad: {loss_g.requires_grad}")
-        print(f"D parameters frozen: {not self.discriminator.weight_1x1.requires_grad}")
+        print(f"D grad enabled: {any(p.requires_grad for p in self.discriminator.parameters())}")
         print("---- END DEBUG ----\n")
 
         # 🔥 BACKWARD FOR G STEP
