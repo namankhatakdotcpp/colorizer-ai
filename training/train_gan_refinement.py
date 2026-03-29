@@ -552,19 +552,28 @@ class GANRefinementTrainer:
             # Rebuild refined_conditional fresh with new L_expanded_g (using refined_g)
             refined_conditional = torch.cat([L_expanded_g, refined_g], dim=1)  # refined_g has gradients
             
-            # Fresh D(fake) with gradients flowing back to G
+            # 🔥 CRITICAL FIX: SPLIT D FORWARD INTO TWO INDEPENDENT PASSES
+            # Why: Using one forward pass for multiple losses creates graph interference
+            # Solution: Two separate D(fake) calls = two independent computation graphs
+            
+            # ===== 1️⃣ FORWARD FOR ADVERSARIAL LOSS =====
             with torch.cuda.amp.autocast(enabled=self.scaler is not None):
-                disc_fake_fresh = self.discriminator(refined_conditional)
+                disc_fake_adv = self.discriminator(refined_conditional)
             
             # Hinge loss for generator (more stable)
-            loss_adv_g = -torch.mean(disc_fake_fresh[0])
+            loss_adv_g = -torch.mean(disc_fake_adv[0])
 
+            # ===== 2️⃣ FORWARD FOR FEATURE MATCHING (SEPARATE GRAPH) =====
             # Feature matching loss (CRITICAL WEIGHT: 5.0)
-            # IMPORTANT: Use FRESH real features computed from detached inputs
+            # IMPORTANT: Use FRESH D forward pass to avoid graph sharing
             loss_fm = torch.tensor(0.0, device=device)
-            if isinstance(disc_fake_fresh, (list, tuple)) and len(disc_fake_fresh) > 1:
+            if isinstance(disc_fake_adv, (list, tuple)) and len(disc_fake_adv) > 1:
+                # Call D AGAIN with independent forward pass
+                with torch.cuda.amp.autocast(enabled=self.scaler is not None):
+                    disc_fake_fm = self.discriminator(refined_conditional)
+                
                 # Fake features have gradients (needed for backprop to G)
-                fake_features = disc_fake_fresh[1:]  # All but first (logits)
+                fake_features = disc_fake_fm[1:]  # All but first (logits)
                 
                 # Fresh D(real) to get real features - only for feature comparison
                 # Use no_grad since we don't need gradients through real images
