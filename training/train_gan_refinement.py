@@ -445,13 +445,12 @@ class GANRefinementTrainer:
             self.optimizer_d.zero_grad(set_to_none=True)
             self.d_steps += 1
 
-            # 🔥 GENERATE REFINED FRESH FOR EACH D STEP
-            # Critical: Each D step gets its own generator forward pass
-            # This prevents computation graph conflicts between D iterations
-            with torch.cuda.amp.autocast(enabled=self.scaler is not None):
-                refined_d = self.generator(colorized)  # Fresh forward for D step
-                refined_detached = refined_d.detach()  # Immediately detach
-
+            # 🔥 CRITICAL: Generate fake in no_grad() to prevent D backward flowing into G graph
+            # This is standard GAN practice: D step should NOT have graph connected to G
+            # If D backward tried to flow to G, it would conflict with G step's graph
+            with torch.no_grad():
+                refined_d = self.generator(colorized)  # NO gradient graph
+            
             # Add small noise to real images for stability
             real_noisy = target + 0.05 * torch.randn_like(target)
             real_noisy = torch.clamp(real_noisy, -1.0, 1.0)
@@ -460,7 +459,7 @@ class GANRefinementTrainer:
             real_noisy_for_grad = real_noisy.detach().clone().requires_grad_(True)
             
             # Add noise to fake images
-            fake_noisy = refined_detached + 0.05 * torch.randn_like(refined_detached)
+            fake_noisy = refined_d + 0.05 * torch.randn_like(refined_d)
             fake_noisy = torch.clamp(fake_noisy, -1.0, 1.0)
 
             # UPGRADE: LAB Conditioning (SIMPLE & CLEAN: [L, RGB] = 4 channels)
