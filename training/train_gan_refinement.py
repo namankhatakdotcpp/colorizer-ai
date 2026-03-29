@@ -178,9 +178,6 @@ def fft_loss(fake: torch.Tensor, real: torch.Tensor) -> torch.Tensor:
     return torch.mean(torch.abs(fake_mag - real_mag))
 
 
-    return torch.mean((fake_gram - real_gram) ** 2)
-
-
 class ImageRefinementDataset(Dataset):
     """Dataset for reading colorized and target images."""
 
@@ -443,6 +440,11 @@ class GANRefinementTrainer:
             "loss_fft": [],
         }
 
+        # ============== Generate Once, Use Twice ==============
+        # Generate refined images (will be used by both D and G)
+        with torch.cuda.amp.autocast(enabled=self.scaler is not None):
+            refined = self.generator(colorized)  # NO detach here - gradients flow to G
+
         # ============== Discriminator Step (multiple times) ==============
         for d_iter in range(train_d_steps):
             self.optimizer_d.zero_grad()
@@ -455,12 +457,11 @@ class GANRefinementTrainer:
             # Real images need gradients for R1 penalty
             real_noisy_for_grad = real_noisy.detach().clone().requires_grad_(True)
 
-            # Generate refined images
-            with torch.cuda.amp.autocast(enabled=self.scaler is not None):
-                refined = self.generator(colorized.detach())
-
+            # CRITICAL: Detach fake for discriminator (no gradients through D to G yet)
+            refined_detached = refined.detach()
+            
             # Add noise to fake images
-            fake_noisy = refined.detach() + 0.05 * torch.randn_like(refined.detach())
+            fake_noisy = refined_detached + 0.05 * torch.randn_like(refined_detached)
             fake_noisy = torch.clamp(fake_noisy, -1.0, 1.0)
 
             # UPGRADE: LAB Conditioning (SIMPLE & CLEAN: [L, RGB] = 4 channels)
@@ -508,12 +509,10 @@ class GANRefinementTrainer:
         # ============== Generator Step ==============
         self.optimizer_g.zero_grad()
 
-        # Generate refined images with AMP
+        # Reuse refined from above (with gradients flowing through it)
         with torch.cuda.amp.autocast(enabled=self.scaler is not None):
-            refined = self.generator(colorized)
-
             # UPGRADE: LAB Conditioning for discriminator feedback (4 channels: 1 L + 3 RGB)
-            refined_conditional = torch.cat([L_expanded, refined], dim=1)
+            refined_conditional = torch.cat([L_expanded, refined], dim=1)  # refined NOT detached
             disc_refined = self.discriminator(refined_conditional)
 
             # Hinge loss for generator (more stable)
@@ -531,7 +530,21 @@ class GANRefinementTrainer:
                 loss_perceptual = self.perceptual_loss(refined, target)
 
             # Feature matching loss (CRITICAL WEIGHT: 5.0 not 0.1)
+            # Extract intermediate features from discriminator
             loss_fm = torch.tensor(0.0, device=device)
+            if isinstance(disc_real, (list, tuple)) and len(disc_real) > 1:
+                # Multi-scale discriminator returns list of (logits, features)
+                real_features = disc_real[1:]  # All but first (which is logits)
+                fake_features = disc_refined[1:]  # All but first
+                
+                # Detach real features (standard practice in feature matching)
+                real_features = [f.detach() for f in real_features]
+                
+                # Compute MSE between feature maps
+                fm_loss_total = torch.tensor(0.0, device=device)
+                for real_feat, fake_feat in zip(real_features, fake_features):
+                    fm_loss_total += torch.mean((fake_feat - real_feat) ** 2)
+                loss_fm = fm_loss_total / max(len(real_features), 1)
             
             # NEW: Path Length Regularization (smooth latent mapping)
             loss_pl = torch.tensor(0.0, device=device)
