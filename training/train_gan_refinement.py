@@ -440,15 +440,17 @@ class GANRefinementTrainer:
             "loss_fft": [],
         }
 
-        # ============== Generate Once, Use Twice ==============
-        # Generate refined images (will be used by both D and G)
-        with torch.cuda.amp.autocast(enabled=self.scaler is not None):
-            refined = self.generator(colorized)  # NO detach here - gradients flow to G
-
         # ============== Discriminator Step (multiple times) ==============
         for d_iter in range(train_d_steps):
             self.optimizer_d.zero_grad()
             self.d_steps += 1
+
+            # 🔥 GENERATE REFINED FRESH FOR EACH D STEP
+            # Critical: Each D step gets its own generator forward pass
+            # This prevents computation graph conflicts between D iterations
+            with torch.cuda.amp.autocast(enabled=self.scaler is not None):
+                refined_d = self.generator(colorized)  # Fresh forward for D step
+                refined_detached = refined_d.detach()  # Immediately detach
 
             # Add small noise to real images for stability
             real_noisy = target + 0.05 * torch.randn_like(target)
@@ -456,9 +458,6 @@ class GANRefinementTrainer:
             
             # Real images need gradients for R1 penalty
             real_noisy_for_grad = real_noisy.detach().clone().requires_grad_(True)
-
-            # CRITICAL: Detach fake for discriminator (no gradients through D to G yet)
-            refined_detached = refined.detach()
             
             # Add noise to fake images
             fake_noisy = refined_detached + 0.05 * torch.randn_like(refined_detached)
@@ -489,6 +488,7 @@ class GANRefinementTrainer:
                 loss_r1 = r1_penalty(disc_real[0], real_conditional)
                 loss_d = loss_d + 10.0 * loss_r1
 
+            # 🔥 BACKWARD FOR D STEP
             if self.scaler is not None:
                 self.scaler.scale(loss_d).backward()
                 self.scaler.unscale_(self.optimizer_d)
@@ -497,132 +497,112 @@ class GANRefinementTrainer:
                 
             torch.nn.utils.clip_grad_norm_(self.discriminator.parameters(), max_norm=1.0)
             
+            # 🔥 CRITICAL: After optimizer step, explicitly zero gradients
+            # This prevents old gradients from interfering with G step
             if self.scaler is not None:
                 self.scaler.step(self.optimizer_d)
                 self.scaler.update()
             else:
                 self.optimizer_d.step()
+            
+            # 🔥 EXPLICIT GRADIENT ZEROING
+            # Ensures D parameters are completely clean before G step
+            self.optimizer_d.zero_grad()
 
             losses_dict["loss_d"].append(loss_d.item())
             losses_dict["loss_r1"].append(loss_r1.item() if isinstance(loss_r1, torch.Tensor) else 0.0)
 
         # ============== Generator Step ==============
         # 🔥 CRITICAL: Freeze discriminator to prevent graph overlap during G step
-        # This prevents gradients from flowing through D's forward pass into D's parameter graph
         for p in self.discriminator.parameters():
             p.requires_grad = False
         
-        # CRITICAL: Compute FRESH forward passes to avoid graph reuse error
-        # Do NOT reuse disc_real or disc_refined from D step (they're freed after backward)
         self.optimizer_g.zero_grad()
 
-        # 🔥 HARD SAFETY PATCH: Detach AND clone ALL inputs to guarantee complete isolation
-        # Clone ensures memory is not shared with D step tensors
+        # 🔥 HARD SAFETY: Detach AND clone ALL inputs
         target_g = target.detach().clone()
         colorized_g = colorized.detach().clone()
         L_channel_g = L_channel.detach().clone()
 
+        # 🔥 CRITICAL: All G computations in one autocast block for consistency
         with torch.cuda.amp.autocast(enabled=self.scaler is not None):
-            # 🔥 CRITICAL: Recompute generator output fresh in G step
-            # Do NOT reuse 'refined' from D step - must be independent forward pass
+            # ===== FRESH GENERATOR FORWARD FOR G STEP =====
+            # Critical: NEVER reuse refined tensor from D step
             refined_g = self.generator(colorized_g)
 
-            # L1 loss: preserve content (using fully detached and cloned target)
+            # L1 loss: preserve content
             loss_l1 = self.l1_loss(refined_g, target_g)
 
-            # Identity loss: prevent unwanted color changes (using fully detached and cloned colorized)
+            # Identity loss: prevent unwanted color changes
             loss_identity = self.l1_loss(refined_g, colorized_g)
 
-            # Perceptual loss: VGG features (using fully detached and cloned target)
+            # Perceptual loss: VGG features
             loss_perceptual = torch.tensor(0.0, device=self.device)
             if self.use_perceptual and self.perceptual_loss is not None:
                 loss_perceptual = self.perceptual_loss(refined_g, target_g)
 
-            # FFT Loss (FORCE SAFE COMPUTATION)
-            # Compute FFT from detached tensors only
-            fft_fake = torch.fft.rfft2(refined_g)  # refined_g has gradients
-            fft_real = torch.fft.rfft2(target_g)  # target_g is fully detached
+            # FFT Loss: Frequency domain matching
+            fft_fake = torch.fft.rfft2(refined_g)
+            fft_real = torch.fft.rfft2(target_g)
             loss_fft = torch.mean(torch.abs(fft_fake - fft_real).real)
 
-            # ========== FRESH D FORWARD PASSES ==========
-            # CRITICAL: Rebuild EVERYTHING fresh from detached/cloned inputs
-            # Rebuild L_expanded fresh for G step (using fully detached L_channel_g)
+            # ===== DISCRIMINATOR FRESH FORWARD: ADVERSARIAL LOSS =====
             L_expanded_g = L_channel_g.expand(batch_size, -1, -1, -1) if L_channel_g.dim() == 3 else L_channel_g
+            refined_conditional_adv = torch.cat([L_expanded_g, refined_g], dim=1)
             
-            # Rebuild refined_conditional fresh with new L_expanded_g (using refined_g)
-            refined_conditional = torch.cat([L_expanded_g, refined_g], dim=1)  # refined_g has gradients
-            
-            # 🔥 CRITICAL FIX: SPLIT D FORWARD INTO TWO INDEPENDENT PASSES
-            # Why: Using one forward pass for multiple losses creates graph interference
-            # Solution: Two separate D(fake) calls = two independent computation graphs
-            
-            # ===== 1️⃣ FORWARD FOR ADVERSARIAL LOSS =====
-            with torch.cuda.amp.autocast(enabled=self.scaler is not None):
-                disc_fake_adv = self.discriminator(refined_conditional)
-            
-            # Hinge loss for generator (more stable)
+            disc_fake_adv = self.discriminator(refined_conditional_adv)
             loss_adv_g = -torch.mean(disc_fake_adv[0])
 
-            # ===== 2️⃣ FORWARD FOR FEATURE MATCHING (SEPARATE GRAPH) =====
-            # Feature matching loss (CRITICAL WEIGHT: 5.0)
-            # IMPORTANT: Use FRESH D forward pass to avoid graph sharing
+            # ===== DISCRIMINATOR FRESH FORWARD: FEATURE MATCHING LOSS =====
+            # Create refined_conditional fresh for fm forward
+            refined_conditional_fm = torch.cat([L_expanded_g, refined_g], dim=1)
+            disc_fake_fm = self.discriminator(refined_conditional_fm)
+            
+            # Feature matching loss
             loss_fm = torch.tensor(0.0, device=device)
-            if isinstance(disc_fake_adv, (list, tuple)) and len(disc_fake_adv) > 1:
-                # Call D AGAIN with independent forward pass
-                with torch.cuda.amp.autocast(enabled=self.scaler is not None):
-                    disc_fake_fm = self.discriminator(refined_conditional)
-                
-                # Fake features have gradients (needed for backprop to G)
+            if isinstance(disc_fake_fm, (list, tuple)) and len(disc_fake_fm) > 1:
                 fake_features = disc_fake_fm[1:]  # All but first (logits)
                 
-                # Fresh D(real) to get real features - only for feature comparison
-                # Use no_grad since we don't need gradients through real images
+                # Get real features from fresh discriminator call (inside no_grad)
                 with torch.no_grad():
-                    # 🔥 REBUILD REAL_CONDITIONAL FROM DETACHED/CLONED INPUTS
-                    # Ensure ALL components come from detached sources
                     real_noisy_g = target_g + 0.05 * torch.randn_like(target_g)
                     real_noisy_g = torch.clamp(real_noisy_g, -1.0, 1.0)
-                    
-                    # Fresh real_conditional from fully detached inputs
                     real_conditional_g = torch.cat([L_expanded_g, real_noisy_g], dim=1)
                     
-                    with torch.cuda.amp.autocast(enabled=self.scaler is not None):
-                        disc_real_fresh = self.discriminator(real_conditional_g)
-                    real_features_fresh = disc_real_fresh[1:]  # All but first (logits)
+                    disc_real_fresh = self.discriminator(real_conditional_g)
+                    real_features_fresh = disc_real_fresh[1:]
                 
-                # Detach real features explicitly (doubly safe)
+                # Detach real features
                 real_features = [f.detach() for f in real_features_fresh]
                 
-                # Compute MSE between feature maps
-                # Fake features have gradients, real features don't
+                # Compute feature matching loss
                 fm_loss_total = torch.tensor(0.0, device=device)
                 for real_feat, fake_feat in zip(real_features, fake_features):
                     fm_loss_total += torch.mean((fake_feat - real_feat) ** 2)
                 loss_fm = fm_loss_total / max(len(real_features), 1)
             
-            # Total generator loss (CORE LOSSES ONLY)
-            # CRITICAL: Only use detached losses in computation
+            # ===== COMBINE ALL LOSSES INTO SINGLE SCALAR =====
+            # CRITICAL: All losses combined BEFORE backward
             loss_g = (
-                self.lambda_adversarial * loss_adv_g +           # Hinge loss
-                self.lambda_l1 * loss_l1 +                       # Content (from detached target_g)
-                self.lambda_perceptual * loss_perceptual +       # VGG features (from detached target_g)
-                5.0 * loss_fm +                                  # Texture detail
-                2.0 * loss_identity +                            # Color consistency (from detached colorized_g)
-                0.05 * loss_fft                                  # FFT (from detached target_g)
+                self.lambda_adversarial * loss_adv_g +
+                self.lambda_l1 * loss_l1 +
+                self.lambda_perceptual * loss_perceptual +
+                5.0 * loss_fm +
+                2.0 * loss_identity +
+                0.05 * loss_fft
             )
 
-        # DEBUG: Print gradient states before backward
-        print("---- DEBUG GRAPHS ----")
-        print(f"target.requires_grad: {target.requires_grad}")
+        # 🔥 DEBUG: Print gradient states AFTER computation but BEFORE backward
+        print("---- BEFORE G BACKWARD ----")
+        print(f"refined_g.requires_grad: {refined_g.requires_grad}")
         print(f"target_g.requires_grad: {target_g.requires_grad}")
-        print(f"colorized.requires_grad: {colorized.requires_grad}")
         print(f"colorized_g.requires_grad: {colorized_g.requires_grad}")
-        print(f"L_channel.requires_grad: {L_channel.requires_grad}")
-        print(f"L_channel_g.requires_grad: {L_channel_g.requires_grad}")
-        print(f"refined.requires_grad: {refined.requires_grad}")
         print(f"loss_g.requires_grad: {loss_g.requires_grad}")
+        print(f"D parameters frozen: {not self.discriminator.weight_1x1.requires_grad}")
         print("---- END DEBUG ----\n")
 
+        # 🔥 BACKWARD FOR G STEP
+        # This is the ONLY backward on loss_g for this train step
         if self.scaler is not None:
             self.scaler.scale(loss_g).backward()
             self.scaler.unscale_(self.optimizer_g)
@@ -637,8 +617,10 @@ class GANRefinementTrainer:
         else:
             self.optimizer_g.step()
         
-        # 🔥 CRITICAL: Restore discriminator gradients after G step
-        # This must happen AFTER optimizer_g.step() to prevent interference
+        # 🔥 EXPLICIT: Clear G gradients after step
+        self.optimizer_g.zero_grad()
+        
+        # 🔥 CRITICAL: Restore discriminator gradients AFTER G step is complete
         for p in self.discriminator.parameters():
             p.requires_grad = True
         
