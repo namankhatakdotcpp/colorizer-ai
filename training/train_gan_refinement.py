@@ -537,9 +537,18 @@ class GANRefinementTrainer:
             loss_identity = self.l1_loss(refined_g, colorized_g)
 
             # Perceptual loss: VGG features
+            # 🔥 SAFER COMPUTATION: Compute target features in no_grad to prevent graph reuse
             loss_perceptual = torch.tensor(0.0, device=self.device)
             if self.use_perceptual and self.perceptual_loss is not None:
-                loss_perceptual = self.perceptual_loss(refined_g, target_g)
+                with torch.no_grad():
+                    # Compute target features WITHOUT building graph
+                    target_features = self.perceptual_loss.vgg(target_g)
+                
+                # Compute fake features WITH graph
+                fake_features = self.perceptual_loss.vgg(refined_g)
+                
+                # Compute MSE between detached target and current fake features
+                loss_perceptual = torch.mean((fake_features - [f.detach() for f in target_features]) ** 2)
 
             # FFT Loss: Frequency domain matching
             fft_fake = torch.fft.rfft2(refined_g)
@@ -581,16 +590,27 @@ class GANRefinementTrainer:
                     fm_loss_total += torch.mean((fake_feat - real_feat) ** 2)
                 loss_fm = fm_loss_total / max(len(real_features), 1)
             
-            # ===== COMBINE ALL LOSSES INTO SINGLE SCALAR =====
-            # CRITICAL: All losses combined BEFORE backward
-            loss_g = (
-                self.lambda_adversarial * loss_adv_g +
-                self.lambda_l1 * loss_l1 +
-                self.lambda_perceptual * loss_perceptual +
-                5.0 * loss_fm +
-                2.0 * loss_identity +
-                0.05 * loss_fft
-            )
+            # ===== COMBINE LOSSES SEQUENTIALLY TO BREAK GRAPH REUSE =====
+            # 🔥 CRITICAL FIX: Sequential addition prevents internal graph reuse
+            # This breaks hidden autograd cycles that cause "backward twice" errors
+            
+            loss_g = torch.tensor(0.0, device=device, requires_grad=True)
+            
+            # Add main constraints
+            loss_g = loss_g + self.lambda_adversarial * loss_adv_g
+            loss_g = loss_g + self.lambda_l1 * loss_l1
+            loss_g = loss_g + 2.0 * loss_identity
+            
+            # Add perceptual loss (already computed safely with no_grad target features)
+            loss_g = loss_g + self.lambda_perceptual * loss_perceptual
+            
+            # 🔥 CRITICAL: Clone FM loss to break graph reuse patterns
+            # Feature matching can internally create graph conflicts
+            loss_g = loss_g + 5.0 * loss_fm.clone()
+            
+            # 🔥 CRITICAL: Clone FFT loss to isolate frequency domain computation
+            # FFT operations can interfere with backprop
+            loss_g = loss_g + 0.05 * loss_fft.clone()
 
         # 🔥 DEBUG: Print gradient states AFTER computation but BEFORE backward
         print("---- BEFORE G BACKWARD ----")
