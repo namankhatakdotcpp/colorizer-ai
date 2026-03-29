@@ -792,7 +792,7 @@ class GANRefinementTrainer:
         Returns:
             Epoch number from checkpoint
         """
-        checkpoint = torch.load(checkpoint_path, map_location=self.device)
+        checkpoint = torch.load(checkpoint_path, map_location=self.device, weights_only=False)
 
         self.generator.load_state_dict(checkpoint["generator_state_dict"])
         if "generator_ema_state_dict" in checkpoint:
