@@ -142,10 +142,11 @@ def r1_penalty(real_pred: torch.Tensor, real_img: torch.Tensor) -> torch.Tensor:
     grad_real = torch.autograd.grad(
         outputs=real_pred.sum(),
         inputs=real_img,
-        create_graph=True,
-        retain_graph=True,
+        create_graph=False,
+        retain_graph=False,
+        only_inputs=True,
     )[0]
-    return torch.mean(grad_real ** 2)
+    return grad_real.pow(2).reshape(grad_real.shape[0], -1).sum(1).mean()
 
 
 def fft_loss(fake: torch.Tensor, real: torch.Tensor) -> torch.Tensor:
@@ -481,24 +482,29 @@ class GANRefinementTrainer:
             loss_d_fake = torch.mean(nn.ReLU()(1.0 + disc_fake[0]))
             loss_d = loss_d_real + loss_d_fake
             
-            # R1 Gradient Penalty (lazy regularization every 16 steps)
+            # R1 Gradient Penalty (more frequent to prevent gradient explosion)
             loss_r1 = torch.tensor(0.0, device=device)
-            if self.d_steps % 16 == 0:
-                loss_r1 = r1_penalty(disc_real[0], real_conditional)
-                loss_d = loss_d + 10.0 * loss_r1
+            if self.d_steps % 4 == 0:
+                loss_r1 = r1_penalty(disc_real[0], real_noisy_for_grad)
+                loss_d = loss_d + 1.0 * loss_r1
 
             # 🔥 SAFETY ASSERTION: Verify refined_d has NO gradients
             assert refined_d.requires_grad == False, "ERROR: refined_d MUST NOT have gradients!"
-            print(f"✅ D step {d_iter + 1}: refined_d.requires_grad = {refined_d.requires_grad} (correct)")
+
+            # 🔥 NaN DETECTION - Skip if loss is invalid
+            if not torch.isfinite(loss_d):
+                logger.warning(f"NaN/Inf in D loss, skipping batch")
+                self.optimizer_d.zero_grad(set_to_none=True)
+                continue
 
             # 🔥 BACKWARD FOR D STEP
             if self.scaler is not None:
-                self.scaler.scale(loss_d).backward(retain_graph=True)
+                self.scaler.scale(loss_d).backward()
                 self.scaler.unscale_(self.optimizer_d)
             else:
-                loss_d.backward(retain_graph=True)
+                loss_d.backward()
                 
-            torch.nn.utils.clip_grad_norm_(self.discriminator.parameters(), max_norm=1.0)
+            torch.nn.utils.clip_grad_norm_(self.discriminator.parameters(), max_norm=0.5)
             
             # 🔥 CRITICAL: After optimizer step, explicitly zero gradients
             # This prevents old gradients from interfering with G step
@@ -601,40 +607,35 @@ class GANRefinementTrainer:
                 0.05 * loss_fft
             )
 
-        # 🔥 DEBUG: Print gradient states AFTER computation but BEFORE backward
-        print("---- BEFORE G BACKWARD ----")
-        print(f"refined_g.requires_grad: {refined_g.requires_grad}")
-        print(f"target_g.requires_grad: {target_g.requires_grad}")
-        print(f"colorized_g.requires_grad: {colorized_g.requires_grad}")
-        print(f"loss_g.requires_grad: {loss_g.requires_grad}")
-        print(f"D grad enabled: {any(p.requires_grad for p in self.discriminator.parameters())}")
-        print("---- END DEBUG ----\n")
-
-        # 🔥 SAFETY ASSERTIONS: Verify complete graph isolation
+        # 🔥 SAFETY ASSERTIONS: Verify complete graph isolation (no debug output)
         assert refined_g.requires_grad == True, "ERROR: refined_g MUST have gradients for G step!"
         assert target_g.requires_grad == False, "ERROR: target_g MUST NOT have gradients!"
         assert colorized_g.requires_grad == False, "ERROR: colorized_g MUST NOT have gradients!"
         assert not any(p.requires_grad for p in self.discriminator.parameters()), "ERROR: D parameters MUST be frozen during G step!"
-        print("✅ Graph isolation verified: All conditions met for safe backward\n")
 
-        # 🔥 BACKWARD FOR G STEP
-        # This is the ONLY backward on loss_g for this train step
-        if self.scaler is not None:
-            self.scaler.scale(loss_g).backward()
-            self.scaler.unscale_(self.optimizer_g)
+        # 🔥 NaN DETECTION - Skip if loss is invalid
+        if not torch.isfinite(loss_g):
+            logger.warning(f"NaN/Inf in G loss, skipping batch")
+            self.optimizer_g.zero_grad(set_to_none=True)
         else:
-            loss_g.backward()
+            # 🔥 BACKWARD FOR G STEP
+            # This is the ONLY backward on loss_g for this train step
+            if self.scaler is not None:
+                self.scaler.scale(loss_g).backward()
+                self.scaler.unscale_(self.optimizer_g)
+            else:
+                loss_g.backward()
             
-        torch.nn.utils.clip_grad_norm_(self.generator.parameters(), max_norm=1.0)
-        
-        if self.scaler is not None:
-            self.scaler.step(self.optimizer_g)
-            self.scaler.update()
-        else:
-            self.optimizer_g.step()
-        
-        # 🔥 EXPLICIT: Clear G gradients after step
-        self.optimizer_g.zero_grad(set_to_none=True)
+            torch.nn.utils.clip_grad_norm_(self.generator.parameters(), max_norm=0.5)
+            
+            if self.scaler is not None:
+                self.scaler.step(self.optimizer_g)
+                self.scaler.update()
+            else:
+                self.optimizer_g.step()
+            
+            # 🔥 EXPLICIT: Clear G gradients after step
+            self.optimizer_g.zero_grad(set_to_none=True)
         
         # 🔥 CRITICAL: Restore discriminator gradients AFTER G step is complete
         for p in self.discriminator.parameters():
@@ -686,7 +687,7 @@ class GANRefinementTrainer:
 
         sample_images = None
 
-        with tqdm(total=len(data_loader), desc="Training") as pbar:
+        with tqdm(total=len(data_loader), desc="Training", leave=True) as pbar:
             for batch_idx, batch in enumerate(data_loader):
                 # Move full batch to device (train_step will handle this too)
                 batch = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
@@ -706,7 +707,7 @@ class GANRefinementTrainer:
                 pbar.set_postfix({
                     "G": f"{losses['loss_g']:.4f}",
                     "D": f"{losses['loss_d']:.4f}",
-                })
+                }, refresh=True)
                 pbar.update(1)
 
         # Average losses
@@ -954,11 +955,13 @@ def main():
                 trainer.training_history[key] = []
             trainer.training_history[key].append(value)
 
-        logger.info(f"Loss G: {losses['loss_g']:.4f}")
-        logger.info(f"Loss D: {losses['loss_d']:.4f}")
-        logger.info(f"Loss L1: {losses['loss_l1']:.4f}")
-        logger.info(f"Loss Perceptual: {losses['loss_perceptual']:.4f}")
-        logger.info(f"Loss Adversarial: {losses['loss_adversarial']:.4f}")
+        logger.info(
+            f"Epoch {epoch + 1}/{args.num_epochs} - "
+            f"G: {losses['loss_g']:.4f} | "
+            f"D: {losses['loss_d']:.4f} | "
+            f"L1: {losses['loss_l1']:.4f} | "
+            f"Perc: {losses['loss_perceptual']:.4f}"
+        )
 
         # Save sample images every epoch
         if sample_images is not None:
