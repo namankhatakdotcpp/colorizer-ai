@@ -143,7 +143,7 @@ def r1_penalty(real_pred: torch.Tensor, real_img: torch.Tensor) -> torch.Tensor:
         outputs=real_pred.sum(),
         inputs=real_img,
         create_graph=True,
-        retain_graph=False,
+        retain_graph=True,
     )[0]
     return torch.mean(grad_real ** 2)
 
@@ -365,7 +365,7 @@ class GANRefinementTrainer:
         self.l1_loss = nn.L1Loss()
         
         # Mixed Precision Training (AMP)
-        self.scaler = torch.cuda.amp.GradScaler() if torch.cuda.is_available() else None
+        self.scaler = torch.amp.GradScaler('cuda') if torch.cuda.is_available() else None
 
         try:
             import torchvision
@@ -472,7 +472,7 @@ class GANRefinementTrainer:
             fake_conditional = torch.cat([L_expanded, fake_noisy], dim=1)  # 4 channels: 1 (L) + 3 (RGB)
 
             # Discriminator outputs (multi-scale)
-            with torch.cuda.amp.autocast(enabled=self.scaler is not None):
+            with torch.amp.autocast('cuda', enabled=self.scaler is not None):
                 disc_real = self.discriminator(real_conditional)
                 disc_fake = self.discriminator(fake_conditional)
 
@@ -493,10 +493,10 @@ class GANRefinementTrainer:
 
             # 🔥 BACKWARD FOR D STEP
             if self.scaler is not None:
-                self.scaler.scale(loss_d).backward()
+                self.scaler.scale(loss_d).backward(retain_graph=True)
                 self.scaler.unscale_(self.optimizer_d)
             else:
-                loss_d.backward()
+                loss_d.backward(retain_graph=True)
                 
             torch.nn.utils.clip_grad_norm_(self.discriminator.parameters(), max_norm=1.0)
             
@@ -528,7 +528,7 @@ class GANRefinementTrainer:
         L_channel_g = L_channel.detach().clone()
 
         # 🔥 CRITICAL: All G computations in one autocast block for consistency
-        with torch.cuda.amp.autocast(enabled=self.scaler is not None):
+        with torch.amp.autocast('cuda', enabled=self.scaler is not None):
             # ===== FRESH GENERATOR FORWARD FOR G STEP =====
             # Critical: NEVER reuse refined tensor from D step
             refined_g = self.generator(colorized_g)
@@ -545,8 +545,8 @@ class GANRefinementTrainer:
                 loss_perceptual = self.perceptual_loss(refined_g, target_g.detach())
 
             # FFT Loss: Frequency domain matching
-            fft_fake = torch.fft.rfft2(refined_g)
-            fft_real = torch.fft.rfft2(target_g)
+            fft_fake = torch.fft.rfft2(refined_g.float())
+            fft_real = torch.fft.rfft2(target_g.float())
             loss_fft = torch.mean(torch.abs(fft_fake - fft_real).real)
 
             # ===== SINGLE REFINED CONDITIONAL FOR ALL D FORWARDS =====
@@ -809,6 +809,8 @@ class GANRefinementTrainer:
 
 def main():
     """Main training loop."""
+    import sys
+    
     parser = argparse.ArgumentParser(
         description="Train GAN refinement stage for colorization",
     )
@@ -887,6 +889,18 @@ def main():
     )
 
     args = parser.parse_args()
+
+    # Check that data directories exist and are populated
+    if not Path(args.colorized_dir).exists() or not any(Path(args.colorized_dir).iterdir()):
+        print(f"ERROR: Colorized directory '{args.colorized_dir}' is empty or missing.")
+        print("Run the colorizer pipeline first to generate training data:")
+        print("  python inference_pipeline.py --stages colorizer --output-dir data/colorized/")
+        sys.exit(1)
+    
+    if not Path(args.target_dir).exists() or not any(Path(args.target_dir).iterdir()):
+        print(f"ERROR: Target directory '{args.target_dir}' is empty or missing.")
+        print("Ensure ground truth images are available.")
+        sys.exit(1)
 
     # Setup device
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
