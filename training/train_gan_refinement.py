@@ -537,18 +537,9 @@ class GANRefinementTrainer:
             loss_identity = self.l1_loss(refined_g, colorized_g)
 
             # Perceptual loss: VGG features
-            # 🔥 SAFER COMPUTATION: Compute target features in no_grad to prevent graph reuse
             loss_perceptual = torch.tensor(0.0, device=self.device)
             if self.use_perceptual and self.perceptual_loss is not None:
-                with torch.no_grad():
-                    # Compute target features WITHOUT building graph
-                    target_features = self.perceptual_loss.vgg(target_g)
-                
-                # Compute fake features WITH graph
-                fake_features = self.perceptual_loss.vgg(refined_g)
-                
-                # Compute MSE between detached target and current fake features
-                loss_perceptual = torch.mean((fake_features - [f.detach() for f in target_features]) ** 2)
+                loss_perceptual = self.perceptual_loss(refined_g, target_g.detach())
 
             # FFT Loss: Frequency domain matching
             fft_fake = torch.fft.rfft2(refined_g)
