@@ -487,6 +487,10 @@ class GANRefinementTrainer:
                 loss_r1 = r1_penalty(disc_real[0], real_conditional)
                 loss_d = loss_d + 10.0 * loss_r1
 
+            # 🔥 SAFETY ASSERTION: Verify refined_d has NO gradients
+            assert refined_d.requires_grad == False, "ERROR: refined_d MUST NOT have gradients!"
+            print(f"✅ D step {d_iter + 1}: refined_d.requires_grad = {refined_d.requires_grad} (correct)")
+
             # 🔥 BACKWARD FOR D STEP
             if self.scaler is not None:
                 self.scaler.scale(loss_d).backward()
@@ -545,48 +549,45 @@ class GANRefinementTrainer:
             fft_real = torch.fft.rfft2(target_g)
             loss_fft = torch.mean(torch.abs(fft_fake - fft_real).real)
 
-            # ===== DISCRIMINATOR FRESH FORWARD: ADVERSARIAL LOSS =====
+            # ===== SINGLE REFINED CONDITIONAL FOR ALL D FORWARDS =====
             L_expanded_g = L_channel_g.expand(batch_size, -1, -1, -1) if L_channel_g.dim() == 3 else L_channel_g
-            refined_conditional_adv = torch.cat([L_expanded_g, refined_g], dim=1)
+            refined_conditional = torch.cat([L_expanded_g, refined_g], dim=1)
             
-            disc_fake_adv = self.discriminator(refined_conditional_adv)
+            # --------------------------------------------------------
+            # 1️⃣ ADVERSARIAL LOSS (ONLY GRAPH THAT BUILDS)
+            # --------------------------------------------------------
+            # 🔥 THIS is the ONLY discriminator forward with gradients
+            disc_fake_adv = self.discriminator(refined_conditional)
             loss_adv_g = -torch.mean(disc_fake_adv[0])
 
-            # ===== DISCRIMINATOR FRESH FORWARD: FEATURE MATCHING LOSS =====
-            # Create refined_conditional fresh for fm forward
-            refined_conditional_fm = torch.cat([L_expanded_g, refined_g], dim=1)
-            
-            # 🔥 CRITICAL: Wrap FM forward in no_grad() to prevent graph building
-            # FM only needs features for comparison, NOT for gradients back to G
-            # This prevents graph conflict with adversarial forward
-            with torch.no_grad():
-                disc_fake_fm = self.discriminator(refined_conditional_fm)
-            
-            # Feature matching loss
+            # --------------------------------------------------------
+            # 2️⃣ FEATURE MATCHING (NO GRAPH - COMPLETELY ISOLATED)
+            # --------------------------------------------------------
             loss_fm = torch.tensor(0.0, device=device)
-            if isinstance(disc_fake_fm, (list, tuple)) and len(disc_fake_fm) > 1:
-                fake_features = disc_fake_fm[1:]  # All but first (logits)
+            
+            # 🔥 CRITICAL: Entire FM computation inside no_grad()
+            # This prevents ANY graph building from interfering with adversarial loss
+            with torch.no_grad():
+                # Fake features (no gradients)
+                disc_fake_fm = self.discriminator(refined_conditional)
+                fake_features = disc_fake_fm[1:] if isinstance(disc_fake_fm, (list, tuple)) and len(disc_fake_fm) > 1 else []
                 
-                # Get real features from fresh discriminator call (inside no_grad)
-                with torch.no_grad():
-                    real_noisy_g = target_g + 0.05 * torch.randn_like(target_g)
-                    real_noisy_g = torch.clamp(real_noisy_g, -1.0, 1.0)
-                    real_conditional_g = torch.cat([L_expanded_g, real_noisy_g], dim=1)
-                    
-                    disc_real_fresh = self.discriminator(real_conditional_g)
-                    real_features_fresh = disc_real_fresh[1:]
+                # Real features (no gradients)
+                real_noisy_g = target_g + 0.05 * torch.randn_like(target_g)
+                real_noisy_g = torch.clamp(real_noisy_g, -1.0, 1.0)
+                real_conditional_g = torch.cat([L_expanded_g, real_noisy_g], dim=1)
+                disc_real_fm = self.discriminator(real_conditional_g)
+                real_features = disc_real_fm[1:] if isinstance(disc_real_fm, (list, tuple)) and len(disc_real_fm) > 1 else []
                 
-                # Detach real features
-                real_features = [f.detach() for f in real_features_fresh]
-                
-                # Compute feature matching loss
-                fm_loss_total = torch.tensor(0.0, device=device)
-                for real_feat, fake_feat in zip(real_features, fake_features):
-                    fm_loss_total += torch.mean((fake_feat - real_feat.detach()) ** 2)
-                loss_fm = fm_loss_total / max(len(real_features), 1)
+                # Compute FM loss (no gradients at all)
+                if fake_features and real_features:
+                    fm_loss_total = torch.tensor(0.0, device=device)
+                    for fake_feat, real_feat in zip(fake_features, real_features):
+                        fm_loss_total += torch.mean(torch.abs(fake_feat - real_feat))
+                    loss_fm = fm_loss_total / max(len(real_features), 1)
             
             # ===== COMBINE ALL LOSSES INTO SINGLE SCALAR =====
-            # All losses combined in one clean computation graph
+            # Only loss_adv_g has graph; others are constants
             loss_g = (
                 self.lambda_adversarial * loss_adv_g +
                 self.lambda_l1 * loss_l1 +
@@ -604,6 +605,13 @@ class GANRefinementTrainer:
         print(f"loss_g.requires_grad: {loss_g.requires_grad}")
         print(f"D grad enabled: {any(p.requires_grad for p in self.discriminator.parameters())}")
         print("---- END DEBUG ----\n")
+
+        # 🔥 SAFETY ASSERTIONS: Verify complete graph isolation
+        assert refined_g.requires_grad == True, "ERROR: refined_g MUST have gradients for G step!"
+        assert target_g.requires_grad == False, "ERROR: target_g MUST NOT have gradients!"
+        assert colorized_g.requires_grad == False, "ERROR: colorized_g MUST NOT have gradients!"
+        assert not any(p.requires_grad for p in self.discriminator.parameters()), "ERROR: D parameters MUST be frozen during G step!"
+        print("✅ Graph isolation verified: All conditions met for safe backward\n")
 
         # 🔥 BACKWARD FOR G STEP
         # This is the ONLY backward on loss_g for this train step
