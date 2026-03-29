@@ -480,13 +480,42 @@ class GANRefinementTrainer:
             # Hinge loss for discriminator (more stable than BCE)
             loss_d_real = torch.mean(nn.ReLU()(1.0 - disc_real[0]))
             loss_d_fake = torch.mean(nn.ReLU()(1.0 + disc_fake[0]))
+            
+            # Compute D loss WITHOUT R1 first
             loss_d = loss_d_real + loss_d_fake
             
-            # R1 Gradient Penalty (more frequent to prevent gradient explosion)
-            loss_r1 = torch.tensor(0.0, device=device)
+            # R1 penalty: separate backward, only every 4 steps
+            # 🔥 CRITICAL: R1 uses completely separate forward/backward to avoid double-backward error
             if self.d_steps % 4 == 0:
-                loss_r1 = r1_penalty(disc_real[0], real_noisy_for_grad)
-                loss_d = loss_d + 1.0 * loss_r1
+                # Separate forward pass just for R1
+                real_for_r1 = real_noisy.detach().clone().requires_grad_(True)
+                L_for_r1 = L_expanded.detach().clone()
+                real_cond_r1 = torch.cat([L_for_r1, real_for_r1], dim=1)
+                
+                with torch.amp.autocast('cuda', enabled=self.scaler is not None):
+                    disc_real_r1 = self.discriminator(real_cond_r1)
+                
+                # R1 backward separately
+                r1_grad = torch.autograd.grad(
+                    outputs=disc_real_r1[0].sum(),
+                    inputs=real_for_r1,
+                    create_graph=False,
+                    retain_graph=False,
+                    only_inputs=True,
+                )[0]
+                loss_r1 = r1_grad.pow(2).reshape(r1_grad.shape[0], -1).sum(1).mean()
+                
+                # Add scaled R1 to D loss as a constant (detached)
+                loss_d = loss_d + 1.0 * loss_r1.detach()
+                
+                # Backward R1 separately
+                r1_backward = 1.0 * loss_r1
+                if self.scaler is not None:
+                    self.scaler.scale(r1_backward).backward()
+                else:
+                    r1_backward.backward()
+            else:
+                loss_r1 = torch.tensor(0.0, device=device)
 
             # 🔥 SAFETY ASSERTION: Verify refined_d has NO gradients
             assert refined_d.requires_grad == False, "ERROR: refined_d MUST NOT have gradients!"
@@ -497,12 +526,12 @@ class GANRefinementTrainer:
                 self.optimizer_d.zero_grad(set_to_none=True)
                 continue
 
-            # 🔥 BACKWARD FOR D STEP
+            # 🔥 BACKWARD FOR MAIN D LOSS (graph is now clean, separate from R1)
             if self.scaler is not None:
-                self.scaler.scale(loss_d).backward()
+                self.scaler.scale(loss_d_real + loss_d_fake).backward()
                 self.scaler.unscale_(self.optimizer_d)
             else:
-                loss_d.backward()
+                (loss_d_real + loss_d_fake).backward()
                 
             torch.nn.utils.clip_grad_norm_(self.discriminator.parameters(), max_norm=0.5)
             
