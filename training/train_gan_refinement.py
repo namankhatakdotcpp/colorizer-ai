@@ -511,25 +511,37 @@ class GANRefinementTrainer:
         # Do NOT reuse disc_real or disc_refined from D step (they're freed after backward)
         self.optimizer_g.zero_grad()
 
+        # 🔥 CRITICAL FIX: Detach ALL inputs to break any graph connection to D step
+        # Even though these came from batch with requires_grad=False initially,
+        # we explicitly detach to guarantee complete isolation from D step graph
+        target_g = target.detach()
+        colorized_g = colorized.detach()
+        L_channel_g = L_channel.detach()
+
         with torch.cuda.amp.autocast(enabled=self.scaler is not None):
-            # L1 loss: preserve content (no D needed)
-            loss_l1 = self.l1_loss(refined, target)
+            # DEBUG: Verify requires_grad state before losses
+            # print(f"DEBUG G step - target_g.requires_grad: {target_g.requires_grad}")
+            # print(f"DEBUG G step - colorized_g.requires_grad: {colorized_g.requires_grad}")
+            # print(f"DEBUG G step - refined.requires_grad: {refined.requires_grad}")
 
-            # Identity loss: prevent unwanted color changes (no D needed)
-            loss_identity = self.l1_loss(refined, colorized)
+            # L1 loss: preserve content (using detached target)
+            loss_l1 = self.l1_loss(refined, target_g)
 
-            # Perceptual loss: VGG features (no D needed)
+            # Identity loss: prevent unwanted color changes (using detached colorized)
+            loss_identity = self.l1_loss(refined, colorized_g)
+
+            # Perceptual loss: VGG features (using detached target to prevent graph reuse)
             loss_perceptual = torch.tensor(0.0, device=self.device)
             if self.use_perceptual and self.perceptual_loss is not None:
-                loss_perceptual = self.perceptual_loss(refined, target)
+                loss_perceptual = self.perceptual_loss(refined, target_g)
 
-            # FFT Loss (no D needed)
-            loss_fft = fft_loss(refined, target)
+            # FFT Loss (using detached target - rfft2 should not track through real image)
+            loss_fft = fft_loss(refined, target_g)
 
             # ========== FRESH D FORWARD PASSES ==========
             # CRITICAL: Rebuild EVERYTHING fresh - don't reuse from D step
-            # Rebuild L_expanded fresh for G step
-            L_expanded_g = L_channel.expand(batch_size, -1, -1, -1) if L_channel.dim() == 3 else L_channel
+            # Rebuild L_expanded fresh for G step (using detached L_channel_g)
+            L_expanded_g = L_channel_g.expand(batch_size, -1, -1, -1) if L_channel_g.dim() == 3 else L_channel_g
             
             # Rebuild refined_conditional fresh with new L_expanded_g
             refined_conditional = torch.cat([L_expanded_g, refined], dim=1)  # refined NOT detached
@@ -551,19 +563,19 @@ class GANRefinementTrainer:
                 # Fresh D(real) to get real features - only for feature comparison
                 # Use no_grad since we don't need gradients through real images
                 with torch.no_grad():
-                    # 🔥 REBUILD REAL_CONDITIONAL FOR G STEP (CRITICAL FIX)
-                    # Don't reuse real_conditional from D step - it's part of freed graph
-                    real_noisy_g = target + 0.05 * torch.randn_like(target)
+                    # 🔥 REBUILD EVERYTHING WITH DETACHED INPUTS
+                    # Ensure target_g stays detached throughout
+                    real_noisy_g = target_g + 0.05 * torch.randn_like(target_g)
                     real_noisy_g = torch.clamp(real_noisy_g, -1.0, 1.0)
                     
-                    # Fresh real_conditional with fresh L_expanded and real_noisy
+                    # Fresh real_conditional with detached tensors
                     real_conditional_g = torch.cat([L_expanded_g, real_noisy_g], dim=1)
                     
                     with torch.cuda.amp.autocast(enabled=self.scaler is not None):
                         disc_real_fresh = self.discriminator(real_conditional_g)
                     real_features_fresh = disc_real_fresh[1:]  # All but first (logits)
                 
-                # Detach real features - they're already in no_grad context but be explicit
+                # Detach real features explicitly (redundant but safe)
                 real_features = [f.detach() for f in real_features_fresh]
                 
                 # Compute MSE between feature maps
@@ -582,6 +594,12 @@ class GANRefinementTrainer:
                 2.0 * loss_identity +                            # Color consistency
                 0.05 * loss_fft                                  # FFT (FID optimization)
             )
+
+        # DEBUG: Print gradient states before backward
+        # print(f"\nDEBUG Before backward:")
+        # print(f"  refined.requires_grad: {refined.requires_grad}")
+        # print(f"  loss_g: {loss_g}")
+        # print(f"  loss_g.requires_grad: {loss_g.requires_grad}")
 
         if self.scaler is not None:
             self.scaler.scale(loss_g).backward()
