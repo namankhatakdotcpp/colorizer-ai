@@ -507,53 +507,60 @@ class GANRefinementTrainer:
             losses_dict["loss_r1"].append(loss_r1.item() if isinstance(loss_r1, torch.Tensor) else 0.0)
 
         # ============== Generator Step ==============
+        # CRITICAL: Compute FRESH forward passes to avoid graph reuse error
+        # Do NOT reuse disc_real or disc_refined from D step (they're freed after backward)
         self.optimizer_g.zero_grad()
 
-        # Reuse refined from above (with gradients flowing through it)
         with torch.cuda.amp.autocast(enabled=self.scaler is not None):
-            # UPGRADE: LAB Conditioning for discriminator feedback (4 channels: 1 L + 3 RGB)
-            refined_conditional = torch.cat([L_expanded, refined], dim=1)  # refined NOT detached
-            disc_refined = self.discriminator(refined_conditional)
-
-            # Hinge loss for generator (more stable)
-            loss_adv_g = -torch.mean(disc_refined[0])
-
-            # L1 loss: preserve content
+            # L1 loss: preserve content (no D needed)
             loss_l1 = self.l1_loss(refined, target)
 
-            # Identity loss: prevent unwanted color changes
+            # Identity loss: prevent unwanted color changes (no D needed)
             loss_identity = self.l1_loss(refined, colorized)
 
-            # Perceptual loss: feature matching
+            # Perceptual loss: VGG features (no D needed)
             loss_perceptual = torch.tensor(0.0, device=self.device)
             if self.use_perceptual and self.perceptual_loss is not None:
                 loss_perceptual = self.perceptual_loss(refined, target)
 
-            # Feature matching loss (CRITICAL WEIGHT: 5.0 not 0.1)
-            # Extract intermediate features from discriminator
+            # FFT Loss (no D needed)
+            loss_fft = fft_loss(refined, target)
+
+            # ========== FRESH D FORWARD PASSES ==========
+            # These are NEW computations, not reused from D step
+            refined_conditional = torch.cat([L_expanded, refined], dim=1)  # refined NOT detached
+            
+            # Fresh D(fake) with gradients flowing back to G
+            with torch.cuda.amp.autocast(enabled=self.scaler is not None):
+                disc_fake_fresh = self.discriminator(refined_conditional)
+            
+            # Hinge loss for generator (more stable)
+            loss_adv_g = -torch.mean(disc_fake_fresh[0])
+
+            # Feature matching loss (CRITICAL WEIGHT: 5.0)
+            # IMPORTANT: Use FRESH real features computed here, not from D step
             loss_fm = torch.tensor(0.0, device=device)
-            if isinstance(disc_real, (list, tuple)) and len(disc_real) > 1:
-                # Multi-scale discriminator returns list of (logits, features)
-                real_features = disc_real[1:]  # All but first (which is logits)
-                fake_features = disc_refined[1:]  # All but first
+            if isinstance(disc_fake_fresh, (list, tuple)) and len(disc_fake_fresh) > 1:
+                # Fake features have gradients (needed for backprop to G)
+                fake_features = disc_fake_fresh[1:]  # All but first (logits)
                 
-                # Detach real features (standard practice in feature matching)
-                real_features = [f.detach() for f in real_features]
+                # Fresh D(real) to get real features - only for feature comparison
+                # Use no_grad since we don't need gradients through real images
+                with torch.no_grad():
+                    with torch.cuda.amp.autocast(enabled=self.scaler is not None):
+                        disc_real_fresh = self.discriminator(real_conditional)
+                    real_features_fresh = disc_real_fresh[1:]  # All but first (logits)
+                
+                # Detach real features - they're already in no_grad context but be explicit
+                real_features = [f.detach() for f in real_features_fresh]
                 
                 # Compute MSE between feature maps
+                # Fake features have gradients, real features don't
                 fm_loss_total = torch.tensor(0.0, device=device)
                 for real_feat, fake_feat in zip(real_features, fake_features):
                     fm_loss_total += torch.mean((fake_feat - real_feat) ** 2)
                 loss_fm = fm_loss_total / max(len(real_features), 1)
             
-            # NEW: Path Length Regularization (smooth latent mapping)
-            loss_pl = torch.tensor(0.0, device=device)
-            if self.d_steps % 4 == 0:  # Compute every 4 steps for efficiency
-                pass  # Path length removed for simplification
-            
-            # NEW: FFT Loss (frequency domain - safe with rfft2)
-            loss_fft = fft_loss(refined, target)
-
             # Total generator loss (CORE LOSSES ONLY)
             loss_g = (
                 self.lambda_adversarial * loss_adv_g +           # Hinge loss
