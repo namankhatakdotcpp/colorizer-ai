@@ -442,7 +442,7 @@ class GANRefinementTrainer:
 
         # ============== Discriminator Step (multiple times) ==============
         for d_iter in range(train_d_steps):
-            self.optimizer_d.zero_grad()
+            self.optimizer_d.zero_grad(set_to_none=True)
             self.d_steps += 1
 
             # 🔥 GENERATE REFINED FRESH FOR EACH D STEP
@@ -507,7 +507,7 @@ class GANRefinementTrainer:
             
             # 🔥 EXPLICIT GRADIENT ZEROING
             # Ensures D parameters are completely clean before G step
-            self.optimizer_d.zero_grad()
+            self.optimizer_d.zero_grad(set_to_none=True)
 
             losses_dict["loss_d"].append(loss_d.item())
             losses_dict["loss_r1"].append(loss_r1.item() if isinstance(loss_r1, torch.Tensor) else 0.0)
@@ -517,7 +517,7 @@ class GANRefinementTrainer:
         for p in self.discriminator.parameters():
             p.requires_grad = False
         
-        self.optimizer_g.zero_grad()
+        self.optimizer_g.zero_grad(set_to_none=True)
 
         # 🔥 HARD SAFETY: Detach AND clone ALL inputs
         target_g = target.detach().clone()
@@ -581,27 +581,16 @@ class GANRefinementTrainer:
                     fm_loss_total += torch.mean((fake_feat - real_feat) ** 2)
                 loss_fm = fm_loss_total / max(len(real_features), 1)
             
-            # ===== COMBINE LOSSES SEQUENTIALLY TO BREAK GRAPH REUSE =====
-            # 🔥 CRITICAL FIX: Sequential addition prevents internal graph reuse
-            # This breaks hidden autograd cycles that cause "backward twice" errors
-            
-            loss_g = torch.tensor(0.0, device=device, requires_grad=True)
-            
-            # Add main constraints
-            loss_g = loss_g + self.lambda_adversarial * loss_adv_g
-            loss_g = loss_g + self.lambda_l1 * loss_l1
-            loss_g = loss_g + 2.0 * loss_identity
-            
-            # Add perceptual loss (already computed safely with no_grad target features)
-            loss_g = loss_g + self.lambda_perceptual * loss_perceptual
-            
-            # 🔥 CRITICAL: Clone FM loss to break graph reuse patterns
-            # Feature matching can internally create graph conflicts
-            loss_g = loss_g + 5.0 * loss_fm.clone()
-            
-            # 🔥 CRITICAL: Clone FFT loss to isolate frequency domain computation
-            # FFT operations can interfere with backprop
-            loss_g = loss_g + 0.05 * loss_fft.clone()
+            # ===== COMBINE ALL LOSSES INTO SINGLE SCALAR =====
+            # All losses combined in one clean computation graph
+            loss_g = (
+                self.lambda_adversarial * loss_adv_g +
+                self.lambda_l1 * loss_l1 +
+                2.0 * loss_identity +
+                self.lambda_perceptual * loss_perceptual +
+                5.0 * loss_fm +
+                0.05 * loss_fft
+            )
 
         # 🔥 DEBUG: Print gradient states AFTER computation but BEFORE backward
         print("---- BEFORE G BACKWARD ----")
@@ -629,7 +618,7 @@ class GANRefinementTrainer:
             self.optimizer_g.step()
         
         # 🔥 EXPLICIT: Clear G gradients after step
-        self.optimizer_g.zero_grad()
+        self.optimizer_g.zero_grad(set_to_none=True)
         
         # 🔥 CRITICAL: Restore discriminator gradients AFTER G step is complete
         for p in self.discriminator.parameters():
