@@ -523,20 +523,24 @@ class GANRefinementTrainer:
         L_channel_g = L_channel.detach().clone()
 
         with torch.cuda.amp.autocast(enabled=self.scaler is not None):
+            # 🔥 CRITICAL: Recompute generator output fresh in G step
+            # Do NOT reuse 'refined' from D step - must be independent forward pass
+            refined_g = self.generator(colorized_g)
+
             # L1 loss: preserve content (using fully detached and cloned target)
-            loss_l1 = self.l1_loss(refined, target_g)
+            loss_l1 = self.l1_loss(refined_g, target_g)
 
             # Identity loss: prevent unwanted color changes (using fully detached and cloned colorized)
-            loss_identity = self.l1_loss(refined, colorized_g)
+            loss_identity = self.l1_loss(refined_g, colorized_g)
 
             # Perceptual loss: VGG features (using fully detached and cloned target)
             loss_perceptual = torch.tensor(0.0, device=self.device)
             if self.use_perceptual and self.perceptual_loss is not None:
-                loss_perceptual = self.perceptual_loss(refined, target_g)
+                loss_perceptual = self.perceptual_loss(refined_g, target_g)
 
             # FFT Loss (FORCE SAFE COMPUTATION)
             # Compute FFT from detached tensors only
-            fft_fake = torch.fft.rfft2(refined)  # refined has gradients
+            fft_fake = torch.fft.rfft2(refined_g)  # refined_g has gradients
             fft_real = torch.fft.rfft2(target_g)  # target_g is fully detached
             loss_fft = torch.mean(torch.abs(fft_fake - fft_real).real)
 
@@ -545,8 +549,8 @@ class GANRefinementTrainer:
             # Rebuild L_expanded fresh for G step (using fully detached L_channel_g)
             L_expanded_g = L_channel_g.expand(batch_size, -1, -1, -1) if L_channel_g.dim() == 3 else L_channel_g
             
-            # Rebuild refined_conditional fresh with new L_expanded_g
-            refined_conditional = torch.cat([L_expanded_g, refined], dim=1)  # refined has gradients
+            # Rebuild refined_conditional fresh with new L_expanded_g (using refined_g)
+            refined_conditional = torch.cat([L_expanded_g, refined_g], dim=1)  # refined_g has gradients
             
             # Fresh D(fake) with gradients flowing back to G
             with torch.cuda.amp.autocast(enabled=self.scaler is not None):
