@@ -556,7 +556,12 @@ class GANRefinementTrainer:
             # ===== DISCRIMINATOR FRESH FORWARD: FEATURE MATCHING LOSS =====
             # Create refined_conditional fresh for fm forward
             refined_conditional_fm = torch.cat([L_expanded_g, refined_g], dim=1)
-            disc_fake_fm = self.discriminator(refined_conditional_fm)
+            
+            # 🔥 CRITICAL: Wrap FM forward in no_grad() to prevent graph building
+            # FM only needs features for comparison, NOT for gradients back to G
+            # This prevents graph conflict with adversarial forward
+            with torch.no_grad():
+                disc_fake_fm = self.discriminator(refined_conditional_fm)
             
             # Feature matching loss
             loss_fm = torch.tensor(0.0, device=device)
@@ -578,7 +583,7 @@ class GANRefinementTrainer:
                 # Compute feature matching loss
                 fm_loss_total = torch.tensor(0.0, device=device)
                 for real_feat, fake_feat in zip(real_features, fake_features):
-                    fm_loss_total += torch.mean((fake_feat - real_feat) ** 2)
+                    fm_loss_total += torch.mean((fake_feat - real_feat.detach()) ** 2)
                 loss_fm = fm_loss_total / max(len(real_features), 1)
             
             # ===== COMBINE ALL LOSSES INTO SINGLE SCALAR =====
