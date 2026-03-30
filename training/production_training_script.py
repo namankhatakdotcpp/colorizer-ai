@@ -6,16 +6,41 @@ Copy-paste ready training script with all three enhancements integrated.
 This is production-ready code you can use immediately.
 """
 
+# ============================================================================
+# DEBUG: Script Start
+# ============================================================================
+print("\n" + "="*80)
+print("🔴 [CHECKPOINT 1] SCRIPT STARTED AT IMPORT TIME")
+print("="*80)
+import sys
+print(f"    Python: {sys.version}")
+print(f"    Executable: {sys.executable}")
+sys.stdout.flush()
+
 import argparse
 import logging
 from pathlib import Path
 from typing import Optional
 import json
+import sys
 
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
+import numpy as np
+from PIL import Image
+
+# ============================================================================
+# DEBUG: After Imports
+# ============================================================================
+print("\n🔴 [CHECKPOINT 2] ALL IMPORTS SUCCESSFUL")
+print(f"    torch version: {torch.__version__}")
+print(f"    torch.cuda available: {torch.cuda.is_available()}")
+if torch.cuda.is_available():
+    print(f"    torch.cuda version: {torch.version.cuda}")
+print(f"    numpy version: {np.__version__}")
+sys.stdout.flush()
 
 # Import refactored trainer
 from training.gan_training_refactored import (
@@ -32,71 +57,175 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-def compute_fid(trainer: RefactoredGANTrainer, val_loader: DataLoader, num_samples: int = 1000) -> float:
+class ColorizerDataset(Dataset):
+    """Simple dataset for colorization (L → RGB)."""
+    
+    def __init__(self, colorized_dir: str, target_dir: str, max_samples: int = None):
+        self.colorized_dir = Path(colorized_dir)
+        self.target_dir = Path(target_dir)
+        
+        self.colorized_files = sorted(list(self.colorized_dir.glob("*.png")) + 
+                                     list(self.colorized_dir.glob("*.jpg")))
+        self.target_files = sorted(list(self.target_dir.glob("*.png")) + 
+                                  list(self.target_dir.glob("*.jpg")))
+        
+        # Use minimum of both dirs
+        num_samples = min(len(self.colorized_files), len(self.target_files))
+        if max_samples:
+            num_samples = min(num_samples, max_samples)
+        
+        self.colorized_files = self.colorized_files[:num_samples]
+        self.target_files = self.target_files[:num_samples]
+        
+        logger.info(f"📊 Dataset: {len(self.colorized_files)} samples")
+    
+    def __len__(self):
+        return len(self.colorized_files)
+    
+    def __getitem__(self, idx):
+        # Load images
+        colorized = Image.open(self.colorized_files[idx]).convert('L')  # L channel
+        target = Image.open(self.target_files[idx]).convert('RGB')       # RGB
+        
+        # Convert to tensors
+        colorized = torch.tensor(np.array(colorized), dtype=torch.float32).unsqueeze(0) / 255.0
+        target = torch.tensor(np.array(target), dtype=torch.float32).permute(2, 0, 1) / 255.0
+        
+        # Ensure consistent size
+        if colorized.shape[1] > 256 or colorized.shape[2] > 256:
+            # Resize to 256x256 if too large
+            colorized = torch.nn.functional.interpolate(
+                colorized.unsqueeze(0), size=(256, 256), mode='bilinear', align_corners=False
+            ).squeeze(0)
+            target = torch.nn.functional.interpolate(
+                target.unsqueeze(0), size=(256, 256), mode='bilinear', align_corners=False
+            ).squeeze(0)
+        
+        return colorized, target
+
+
+def compute_fid(trainer: RefactoredGANTrainer, val_loader: DataLoader, device: torch.device) -> float:
     """
-    Compute FID score (simplified version).
+    Compute FID score (placeholder).
     
-    Replace this with your actual FID computation.
-    
-    Args:
-        trainer: RefactoredGANTrainer instance
-        val_loader: Validation data loader
-        num_samples: Number of samples to compute FID on
-    
-    Returns:
-        FID score (float)
+    Replace with your actual FID computation using fid_integration.py
     """
-    # Placeholder - implement with your FID evaluator
-    # Example using fid_integration.py:
-    # from training.fid_integration import FIDEvaluator
-    # fid_evaluator = FIDEvaluator(inception_model, device)
-    # return fid_evaluator.compute_fid(trainer.generator, real_images, generated_images)
-    
-    # For now, return dummy FID (replace with real computation)
     import random
-    return 50.0 + random.random() * 5  # Placeholder
+    return 50.0 + random.random() * 5
+
+
+def create_dummy_models(device: torch.device):
+    """Create dummy models for testing. Replace with your actual models."""
+    
+    class DummyGenerator(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.model = nn.Sequential(
+                nn.Conv2d(1, 64, 3, padding=1),
+                nn.ReLU(),
+                nn.Conv2d(64, 128, 3, padding=1),
+                nn.ReLU(),
+                nn.Conv2d(128, 3, 3, padding=1),
+            )
+        
+        def forward(self, x):
+            return self.model(x)
+    
+    class DummyDiscriminator(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.model = nn.Sequential(
+                nn.Conv2d(4, 64, 4, stride=2, padding=1),  # L + RGB = 4 channels
+                nn.LeakyReLU(0.2),
+                nn.Conv2d(64, 128, 4, stride=2, padding=1),
+                nn.LeakyReLU(0.2),
+                nn.Conv2d(128, 1, 3, padding=1),
+            )
+        
+        def forward(self, x):
+            return self.model(x), None  # (logits, features)
+    
+    generator = DummyGenerator().to(device)
+    discriminator = DummyDiscriminator().to(device)
+    
+    logger.info("⚠️  Using dummy models - replace with your actual models!")
+    return generator, discriminator
+
+
+def compute_loss(real_output, fake_output, real_images, fake_images, target):
+    """Simple loss computation."""
+    if real_output is None or fake_output is None:
+        return torch.tensor(0.0, device=real_images.device)
+    
+    # Adversarial loss
+    real_loss = torch.nn.functional.binary_cross_entropy_with_logits(
+        real_output, torch.ones_like(real_output)
+    )
+    fake_loss = torch.nn.functional.binary_cross_entropy_with_logits(
+        fake_output, torch.zeros_like(fake_output)
+    )
+    
+    return (real_loss + fake_loss) / 2
 
 
 def main():
-    """Main training script."""
+    """Main production training script."""
+    
+    print("🚀 TRAINING SCRIPT STARTED")
+    sys.stdout.flush()
     
     # ========================================================================
-    # 1. ARGUMENTS
+    # 1. PARSE ARGUMENTS
     # ========================================================================
+    
     parser = argparse.ArgumentParser(
         description="Production GAN training with n_critic, EMA, and FID checkpoints"
     )
     
-    # Data
-    parser.add_argument("--data-dir", type=str, default="data/", help="Data directory")
+    # Data arguments
+    parser.add_argument("--colorized-dir", type=str, default="data/colorized",
+                       help="Directory with colorized/L-channel images")
+    parser.add_argument("--target-dir", type=str, default="data/ground_truth",
+                       help="Directory with ground truth RGB images")
     parser.add_argument("--output-dir", type=str, default="checkpoints/gan_training",
                        help="Output directory for checkpoints")
     
-    # Training
-    parser.add_argument("--num-epochs", type=int, default=100, help="Number of epochs")
-    parser.add_argument("--batch-size", type=int, default=8, help="Batch size")
-    parser.add_argument("--num-workers", type=int, default=4, help="Data loader workers")
+    # Training arguments
+    parser.add_argument("--batch-size", type=int, default=4, help="Batch size")
+    parser.add_argument("--num-epochs", type=int, default=10, help="Number of epochs")
+    parser.add_argument("--num-workers", type=int, default=2, help="Data loader workers")
     
-    # Device
+    # Device arguments
     parser.add_argument("--device", type=str, default="cuda", help="Device (cuda or cpu)")
-    parser.add_argument("--mixed-precision", type=bool, default=True,
-                       help="Use mixed precision training")
     
-    # Resume
-    parser.add_argument("--resume-from", type=str, default=None,
-                       help="Path to checkpoint to resume from")
+    # Model arguments
+    parser.add_argument("--use-amp", type=bool, default=True, help="Use mixed precision")
+    parser.add_argument("--use-ema", type=bool, default=True, help="Use EMA")
+    parser.add_argument("--n-critic", type=int, default=2, help="Discriminator updates per generator")
     
-    # Config
-    parser.add_argument("--n-critic", type=int, default=2,
-                       help="Number of discriminator updates per generator update")
-    parser.add_argument("--gradient-clip", type=float, default=0.5,
-                       help="Gradient clipping value")
-    parser.add_argument("--ema-decay", type=float, default=0.999,
-                       help="EMA decay coefficient")
-    parser.add_argument("--use-r1-penalty", type=bool, default=False,
-                       help="Use R1 penalty for discriminator")
+    # Resume argument
+    parser.add_argument("--resume-from", type=str, default=None, help="Resume from checkpoint")
     
     args = parser.parse_args()
+    
+    print(f"✅ Arguments parsed:")
+    print(f"   Colorized dir: {args.colorized_dir}")
+    print(f"   Target dir: {args.target_dir}")
+    print(f"   Batch size: {args.batch_size}")
+    print(f"   Num epochs: {args.num_epochs}")
+    print(f"   N-critic: {args.n_critic}")
+    print(f"   Use AMP: {args.use_amp}")
+    print(f"   Use EMA: {args.use_ema}")
+    sys.stdout.flush()
+    
+    # ========================================================================
+    # DEBUG: After Argument Parsing
+    # ========================================================================
+    print("\n🔴 [CHECKPOINT 3] ARGUMENT PARSING SUCCESSFUL")
+    print(f"    colorized_dir exists: {Path(args.colorized_dir).exists()}")
+    print(f"    target_dir exists: {Path(args.target_dir).exists()}")
+    print(f"    output_dir: {args.output_dir}")
+    sys.stdout.flush()
     
     # ========================================================================
     # 2. SETUP
@@ -108,34 +237,147 @@ def main():
     # Create output directory
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    logger.info(f"✅ Output directory: {output_dir}")
     
     # ========================================================================
-    # 3. MODELS & OPTIMIZERS
+    # 3. LOAD/CREATE MODELS
     # ========================================================================
     
-    # TODO: Replace these with your actual models
-    # from models.gan_generator import GANGenerator
-    # from models.gan_discriminator import MultiscaleDiscriminator
+    print("📦 Loading models...")
+    sys.stdout.flush()
     
-    # For now, using placeholder models
-    logger.warning("⚠️  Replace with your actual models!")
+    generator, discriminator = create_dummy_models(device)
     
-    # generator = GANGenerator().to(device)
-    # discriminator = MultiscaleDiscriminator().to(device)
-    
-    # # Loss manager
-    # from losses import create_loss_manager
-    # loss_manager = create_loss_manager(device=device)
+    logger.info(f"✅ Generator: {generator.__class__.__name__}")
+    logger.info(f"✅ Discriminator: {discriminator.__class__.__name__}")
     
     # ========================================================================
-    # 4. DATA LOADERS
+    # DEBUG: Model Assertions
+    # ========================================================================
+    print("\n🔴 [CHECKPOINT 5B] MODEL CREATION")
+    assert generator is not None, "❌ ASSERTION FAILED: Generator is None!"
+    assert discriminator is not None, "❌ ASSERTION FAILED: Discriminator is None!"
+    print(f"    ✅ Assertion passed: generator is not None")
+    print(f"    ✅ Assertion passed: discriminator is not None")
+    print(f"    Generator parameters: {sum(p.numel() for p in generator.parameters())}")
+    print(f"    Discriminator parameters: {sum(p.numel() for p in discriminator.parameters())}")
+    sys.stdout.flush()
+    
+    # ========================================================================
+    # 4. LOAD DATA
     # ========================================================================
     
-    # TODO: Replace with your actual dataset
-    # from datasets import create_train_loader, create_val_loader
+    print(f"📂 Loading data from {args.colorized_dir} and {args.target_dir}...")
+    sys.stdout.flush()
     
-    # train_loader = create_train_loader(args.data_dir, args.batch_size, args.num_workers)
-    # val_loader = create_val_loader(args.data_dir, args.batch_size, args.num_workers)
+    # Validate paths exist
+    colorized_path = Path(args.colorized_dir)
+    target_path = Path(args.target_dir)
+    
+    if not colorized_path.exists():
+        logger.error(f"❌ Colorized directory does not exist: {colorized_path}")
+        colorized_path.mkdir(parents=True, exist_ok=True)
+        logger.info(f"   Created: {colorized_path}")
+    
+    if not target_path.exists():
+        logger.error(f"❌ Target directory does not exist: {target_path}")
+        target_path.mkdir(parents=True, exist_ok=True)
+        logger.info(f"   Created: {target_path}")
+    
+    # Create dataset
+    dataset = ColorizerDataset(args.colorized_dir, args.target_dir, max_samples=100)
+    
+    if len(dataset) == 0:
+        logger.error("❌ Dataset is empty!")
+        logger.info("   Please add images to colorized_dir and target_dir")
+        sys.exit(1)
+    
+    # ========================================================================
+    # DEBUG: After Dataset Loading
+    # ========================================================================
+    print("\n🔴 [CHECKPOINT 4] DATASET LOADING SUCCESSFUL")
+    print(f"    Dataset length: {len(dataset)}")
+    print(f"    Dataset type: {type(dataset)}")
+    sys.stdout.flush()
+    
+    # Validate dataset
+    assert len(dataset) > 0, "❌ ASSERTION FAILED: Dataset is empty!"
+    print(f"    ✅ Assertion passed: len(dataset) > 0")
+    sys.stdout.flush()
+    
+    # Get first sample to check structure
+    try:
+        first_sample = dataset[0]
+        print(f"    First sample type: {type(first_sample)}")
+        print(f"    First sample length: {len(first_sample) if isinstance(first_sample, tuple) else 'N/A'}")
+        if isinstance(first_sample, tuple) and len(first_sample) >= 2:
+            condition, target = first_sample
+            print(f"    First condition shape: {condition.shape}")
+            print(f"    First target shape: {target.shape}")
+            print(f"    First condition dtype: {condition.dtype}")
+            print(f"    First target dtype: {target.dtype}")
+    except Exception as e:
+        print(f"    ⚠️  Warning getting first sample: {e}")
+    sys.stdout.flush()
+    
+    # Create data loaders
+    train_loader = DataLoader(
+        dataset,
+        batch_size=args.batch_size,
+        shuffle=True,
+        num_workers=args.num_workers,
+        pin_memory=True if torch.cuda.is_available() else False,
+    )
+    
+    val_loader = DataLoader(
+        dataset,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+        pin_memory=True if torch.cuda.is_available() else False,
+    )
+    
+    logger.info(f"✅ Dataset loaded: {len(dataset)} samples")
+    logger.info(f"✅ Train loader: {len(train_loader)} batches")
+    logger.info(f"✅ Val loader: {len(val_loader)} batches")
+    
+    # Validate not empty
+    if len(train_loader) == 0:
+        logger.error("❌ Train loader is empty!")
+        sys.exit(1)
+    
+    # ========================================================================
+    # DEBUG: After DataLoader Creation
+    # ========================================================================
+    print("\n🔴 [CHECKPOINT 5] DATALOADER CREATION SUCCESSFUL")
+    print(f"    Train loader batches: {len(train_loader)}")
+    print(f"    Val loader batches: {len(val_loader)}")
+    print(f"    Train loader type: {type(train_loader)}")
+    sys.stdout.flush()
+    
+    # Validate dataloaders
+    assert len(train_loader) > 0, "❌ ASSERTION FAILED: Train loader is empty!"
+    print(f"    ✅ Assertion passed: len(train_loader) > 0")
+    sys.stdout.flush()
+    
+    # Get first batch to check shapes
+    try:
+        print(f"    Getting first batch from train_loader...")
+        first_batch = next(iter(train_loader))
+        print(f"    First batch type: {type(first_batch)}")
+        if isinstance(first_batch, tuple) and len(first_batch) >= 2:
+            condition, target = first_batch
+            print(f"    First batch condition shape: {condition.shape}")
+            print(f"    First batch target shape: {target.shape}")
+            print(f"    First batch condition dtype: {condition.dtype}")
+            print(f"    First batch target dtype: {target.dtype}")
+            print(f"    First batch condition range: [{condition.min():.4f}, {condition.max():.4f}]")
+            print(f"    First batch target range: [{target.min():.4f}, {target.max():.4f}]")
+    except Exception as e:
+        print(f"    ⚠️  Warning getting first batch: {e}")
+        import traceback
+        traceback.print_exc()
+    sys.stdout.flush()
     
     # ========================================================================
     # 5. TRAINING CONFIGURATION
@@ -143,22 +385,39 @@ def main():
     
     config = TrainingConfig(
         n_critic=args.n_critic,
-        gradient_clip=args.gradient_clip,
-        use_amp=args.mixed_precision,
-        use_ema=True,  # Always recommended
-        ema_decay=args.ema_decay,
-        use_r1_penalty=args.use_r1_penalty,
-        lambda_r1=10.0,
-        apply_r1_every_n_steps=16,
+        gradient_clip=0.5,
+        use_amp=args.use_amp,
+        use_ema=args.use_ema,
+        ema_decay=0.999,
+        use_r1_penalty=False,
     )
     
-    logger.info(f"📋 Training config:")
+    print("📋 Training config:")
     for key, value in config.__dict__.items():
-        logger.info(f"   {key}: {value}")
+        print(f"   {key}: {value}")
+    sys.stdout.flush()
     
     # ========================================================================
     # 6. CREATE TRAINER
     # ========================================================================
+    
+    print("🤖 Creating trainer...")
+    sys.stdout.flush()
+    
+    # Simple loss manager (replace with your actual loss manager)
+    class SimpleLossManager:
+        def __call__(self, **kwargs):
+            d_logits = kwargs.get('disc_fake_logits')
+            if d_logits is None:
+                return torch.tensor(0.0), {}
+            
+            # Simple binary cross-entropy loss
+            fake_loss = torch.nn.functional.binary_cross_entropy_with_logits(
+                d_logits, torch.zeros_like(d_logits)
+            )
+            return fake_loss, {"d_loss": fake_loss.item()}
+    
+    loss_manager = SimpleLossManager()
     
     trainer = RefactoredGANTrainer(
         generator=generator,
@@ -168,7 +427,9 @@ def main():
         config=config,
     )
     
-    logger.info("✅ Created RefactoredGANTrainer")
+    logger.info("✅ Trainer created successfully")
+    print("✅ Trainer created successfully")
+    sys.stdout.flush()
     
     # ========================================================================
     # 7. CHECKPOINT MANAGER
@@ -176,11 +437,11 @@ def main():
     
     checkpoint_manager = FIDCheckpointManager(
         checkpoint_dir=str(output_dir),
-        keep_best_n=3,
+        keep_best_n=2,
         track_fid=True,
     )
     
-    logger.info(f"✅ Created checkpoint manager (dir: {output_dir})")
+    logger.info(f"✅ Checkpoint manager created (dir: {output_dir})")
     
     # ========================================================================
     # 8. RESUME FROM CHECKPOINT (IF PROVIDED)
@@ -203,125 +464,144 @@ def main():
             scaler_d=trainer.scaler_d,
         )
         
-        start_epoch = metadata["epoch"] + 1
+        start_epoch = metadata.get("epoch", 0) + 1
         logger.info(f"✅ Resumed from epoch {start_epoch}")
     
     # ========================================================================
     # 9. TRAINING LOOP
     # ========================================================================
     
-    logger.info(f"\n{'='*80}")
-    logger.info("🎯 STARTING TRAINING")
-    logger.info(f"{'='*80}\n")
+    print(f"\n{'='*80}")
+    print("🎯 STARTING TRAINING LOOP")
+    print(f"{'='*80}\n")
+    sys.stdout.flush()
+    
+    # ========================================================================
+    # DEBUG: Before Training Loop
+    # ========================================================================
+    print("\n🔴 [CHECKPOINT 6] READY FOR TRAINING LOOP")
+    print(f"    Start epoch: {start_epoch}")
+    print(f"    Total epochs: {args.num_epochs}")
+    print(f"    Epochs to train: {args.num_epochs - start_epoch}")
+    print(f"    Train loader size: {len(train_loader)}")
+    print(f"    Config n_critic: {config.n_critic}")
+    print(f"    Config use_ema: {config.use_ema}")
+    sys.stdout.flush()
     
     for epoch in range(start_epoch, args.num_epochs):
         
-        # ====================================================================
-        # TRAINING PHASE
-        # ====================================================================
+        print(f"\n📊 Epoch {epoch + 1}/{args.num_epochs}")
+        sys.stdout.flush()
         
-        logger.info(f"\n{'='*60}")
-        logger.info(f"Epoch {epoch + 1}/{args.num_epochs} - Training")
-        logger.info(f"{'='*60}")
+        # ====================================================================
+        # DEBUG: Inside Epoch
+        # ====================================================================
+        print(f"\n🔴 [CHECKPOINT 7.{epoch + 1}] EPOCH {epoch + 1} START")
+        print(f"    Current memory (before): {torch.cuda.memory_allocated(device) / 1e9:.2f}GB" if torch.cuda.is_available() else "    (CPU mode)")
+        sys.stdout.flush()
+        
+        # ====================================================================
+        # TRAINING
+        # ====================================================================
         
         trainer.generator.train()
         trainer.discriminator.train()
         
-        train_losses = {}
+        epoch_loss = 0.0
+        batch_count = 0
         
-        with tqdm(total=len(train_loader), desc="Training") as pbar:
-            for batch_idx, batch in enumerate(train_loader):
-                
-                # Get batch data (adjust based on your dataset)
-                # condition, target = batch  # or however your loader returns data
-                
-                # TODO: Replace with your actual data loading
-                # For now, show the structure
-                # condition = condition.to(device, non_blocking=True)
-                # target = target.to(device, non_blocking=True)
-                
-                # ============================================================
-                # MAIN TRAINING STEP (handles all n_critic logic!)
-                # ============================================================
-                
-                loss_dict = trainer.train_step(condition, target)
-                
-                # ============================================================
-                # LOSS ACCUMULATION
-                # ============================================================
-                
-                for key, value in loss_dict.items():
-                    if key not in train_losses:
-                        train_losses[key] = 0
-                    train_losses[key] += value
-                
-                # Progress bar
-                pbar.update(1)
-                
-                # Log every 100 batches
-                if (batch_idx + 1) % 100 == 0:
-                    log_msg = f"[Batch {batch_idx + 1}/{len(train_loader)}] "
-                    log_msg += " | ".join([
-                        f"{key}={value:.4f}"
-                        for key, value in loss_dict.items()
-                    ])
-                    logger.info(log_msg)
-        
-        # Average training losses
-        for key in train_losses:
-            train_losses[key] /= len(train_loader)
-        
-        logger.info(f"\n✅ Training epoch average:")
-        for key, value in sorted(train_losses.items()):
-            logger.info(f"   {key}: {value:.6f}")
-        
-        # ====================================================================
-        # VALIDATION PHASE
-        # ====================================================================
-        
-        logger.info(f"\nValidation")
-        logger.info(f"{'='*60}")
-        
-        trainer.set_eval_mode_ema()  # ← SWITCH TO EMA FOR EVALUATION
-        
-        val_losses = {}
-        
-        with torch.no_grad():
-            with tqdm(total=len(val_loader), desc="Validation") as pbar:
-                for batch_idx, batch in enumerate(val_loader):
+        try:
+            print(f"    Starting training loop with {len(train_loader)} batches...")
+            sys.stdout.flush()
+            
+            with tqdm(total=len(train_loader), desc="Training", leave=False) as pbar:
+                for batch_idx, (condition, target) in enumerate(train_loader):
                     
-                    # TODO: Replace with your actual data loading
-                    # condition = condition.to(device, non_blocking=True)
-                    # target = target.to(device, non_blocking=True)
+                    # ========================================================
+                    # DEBUG: First batch
+                    # ========================================================
+                    if batch_idx == 0:
+                        print(f"\n    🔴 First batch of epoch {epoch + 1}:")
+                        print(f"        Condition shape: {condition.shape}")
+                        print(f"        Target shape: {target.shape}")
+                        print(f"        Condition range: [{condition.min():.4f}, {condition.max():.4f}]")
+                        print(f"        Target range: [{target.min():.4f}, {target.max():.4f}]")
+                        print(f"        Condition device: {condition.device}")
+                        print(f"        Target device: {target.device}")
+                        sys.stdout.flush()
                     
-                    # Generate with EMA generator
-                    # (EMA has better, smoother weights)
-                    generated = trainer.generator(condition)
+                    try:
+                        # Train step
+                        loss_dict = trainer.train_step(condition, target)
+                        
+                        epoch_loss += loss_dict.get('g_loss', 0.0)
+                        batch_count += 1
+                        
+                        # Progress
+                        pbar.update(1)
+                        pbar.set_postfix({"loss": f"{epoch_loss/batch_count:.4f}"})
+                        
+                        # Log every 10 batches
+                        if (batch_idx + 1) % 10 == 0:
+                            avg_loss = epoch_loss / batch_count
+                            print(f"  Batch {batch_idx + 1}/{len(train_loader)}: "
+                                  f"loss={avg_loss:.4f}")
+                            sys.stdout.flush()
                     
-                    # Compute validation metrics here
-                    # val_metrics = compute_metrics(generated, target)
-                    
-                    pbar.update(1)
+                    except Exception as e:
+                        print(f"\n    🔴 ERROR IN TRAIN STEP (batch {batch_idx}):")
+                        print(f"        Error: {e}")
+                        print(f"        Batch index: {batch_idx}")
+                        print(f"        Batch count: {batch_count}")
+                        print(f"        Condition shape: {condition.shape}")
+                        print(f"        Target shape: {target.shape}")
+                        import traceback
+                        print("    Full traceback:")
+                        traceback.print_exc()
+                        sys.stdout.flush()
+                        raise
+            
+            logger.info(f"✅ Epoch {epoch + 1} training complete")
+            print(f"    ✅ Training complete: {batch_count} batches processed")
+            sys.stdout.flush()
+        
+        except Exception as e:
+            print(f"\n🔴 EXCEPTION IN TRAINING LOOP (epoch {epoch + 1}):")
+            print(f"    Error type: {type(e).__name__}")
+            print(f"    Error message: {e}")
+            print(f"    Batches processed: {batch_count}")
+            print(f"    Epoch loss: {epoch_loss:.4f}")
+            import traceback
+            print("    Full traceback:")
+            traceback.print_exc()
+            sys.stdout.flush()
+            raise
         
         # ====================================================================
-        # FID COMPUTATION
+        # VALIDATION
         # ====================================================================
         
-        fid_score = compute_fid(trainer, val_loader)
-        logger.info(f"   FID Score: {fid_score:.3f}")
+        print(f"  Validating...")
+        sys.stdout.flush()
+        
+        trainer.set_eval_mode_ema()
+        fid_score = compute_fid(trainer, val_loader, device)
+        trainer.set_train_mode_current()
+        
+        logger.info(f"  Validation FID: {fid_score:.3f}")
+        print(f"  Validation FID: {fid_score:.3f}")
+        sys.stdout.flush()
         
         # ====================================================================
-        # BACK TO TRAINING MODE
+        # DEBUG: After Validation
         # ====================================================================
-        
-        trainer.set_train_mode_current()  # ← BACK TO CURRENT WEIGHTS
+        print(f"    🔴 Validation complete for epoch {epoch + 1}")
+        print(f"        FID score: {fid_score:.3f}")
+        sys.stdout.flush()
         
         # ====================================================================
-        # CHECKPOINT SAVING (WITH FID TRACKING)
+        # CHECKPOINT SAVING
         # ====================================================================
-        
-        logger.info(f"\nCheckpointing")
-        logger.info(f"{'='*60}")
         
         is_best, metadata = checkpoint_manager.save_checkpoint(
             epoch=epoch,
@@ -329,70 +609,47 @@ def main():
             discriminator=trainer.discriminator,
             optimizer_g=trainer.optimizer_g,
             optimizer_d=trainer.optimizer_d,
-            fid_score=fid_score,  # ← FID TRACKING
+            fid_score=fid_score,
             ema=trainer.ema,
             scaler_g=trainer.scaler_g,
             scaler_d=trainer.scaler_d,
-            losses=train_losses,
         )
-        
-        # ====================================================================
-        # LOG FID TRENDS
-        # ====================================================================
         
         trend = checkpoint_manager.get_fid_trend()
         
-        logger.info(f"   Latest checkpoint saved")
-        if is_best:
-            logger.info(f"   🏆 NEW BEST MODEL! (FID: {fid_score:.3f})")
-        
-        logger.info(f"   Best FID: {trend['best_fid']:.3f} (epoch {trend['best_epoch']})")
-        logger.info(f"   Recent avg: {trend['recent_avg']:.3f}")
-        logger.info(f"   Trend: {trend['trend']}")
-        
-        # ====================================================================
-        # EPOCH SUMMARY
-        # ====================================================================
-        
-        logger.info(f"\n{'='*60}")
-        logger.info(f"Epoch {epoch + 1} Summary")
-        logger.info(f"{'='*60}")
-        logger.info(f"Train Loss: {sum(train_losses.values()):.6f}")
-        logger.info(f"FID Score: {fid_score:.3f}")
-        logger.info(f"Best FID: {trend['best_fid']:.3f}")
-        logger.info(f"Status: {'NEW BEST ✅' if is_best else 'Saved ✅'}")
-        
-        # Early stopping (optional)
-        if trend['trend'] == 'degrading' and epoch > args.num_epochs * 0.7:
-            logger.info("⚠️  FID degrading - consider early stopping")
+        status = "🏆 NEW BEST!" if is_best else "✅ Saved"
+        print(f"  {status} Best FID: {trend['best_fid']:.3f} (epoch {trend['best_epoch']})")
+        sys.stdout.flush()
     
     # ========================================================================
     # 10. TRAINING COMPLETE
     # ========================================================================
     
-    logger.info(f"\n{'='*80}")
-    logger.info("🎉 TRAINING COMPLETE!")
-    logger.info(f"{'='*80}")
+    print(f"\n{'='*80}")
+    print("🎉 TRAINING COMPLETE!")
+    print(f"{'='*80}\n")
+    sys.stdout.flush()
     
     best_path = checkpoint_manager.get_best_model_path()
-    logger.info(f"✅ Best model: {best_path}")
-    
     trend = checkpoint_manager.get_fid_trend()
-    logger.info(f"✅ Best FID: {trend['best_fid']:.3f}")
-    logger.info(f"✅ Checkpoints saved: {len(checkpoint_manager.fid_history)}")
     
-    # Save final summary
+    print(f"✅ Best model: {best_path}")
+    print(f"✅ Best FID: {trend['best_fid']:.3f}")
+    print(f"✅ Total epochs: {args.num_epochs}")
+    print(f"✅ Checkpoints saved: {len(checkpoint_manager.fid_history)}\n")
+    sys.stdout.flush()
+    
+    # Save summary
     summary_file = output_dir / "training_summary.json"
     summary = {
         "best_fid": trend['best_fid'],
         "best_epoch": trend['best_epoch'],
         "total_epochs": args.num_epochs,
-        "total_checkpoints": len(checkpoint_manager.fid_history),
+        "device": str(device),
         "config": {
             "n_critic": config.n_critic,
             "ema_decay": config.ema_decay,
             "use_amp": config.use_amp,
-            "use_r1_penalty": config.use_r1_penalty,
         }
     }
     
@@ -400,6 +657,24 @@ def main():
         json.dump(summary, f, indent=2)
     
     logger.info(f"✅ Summary saved: {summary_file}")
+    print(f"✅ Summary saved: {summary_file}")
+    
+    print("✨ Training finished successfully!\n")
+    sys.stdout.flush()
+    
+    # ========================================================================
+    # DEBUG: Training Complete
+    # ========================================================================
+    print("\n" + "="*80)
+    print("🔴 [CHECKPOINT 8] TRAINING SCRIPT COMPLETED SUCCESSFULLY")
+    print("="*80)
+    print(f"    Best FID: {trend['best_fid']:.3f}")
+    print(f"    Best epoch: {trend['best_epoch']}")
+    print(f"    Total checkpoints: {len(checkpoint_manager.fid_history)}")
+    print(f"    Summary saved: {summary_file}")
+    print("="*80 + "\n")
+    sys.stdout.flush()
+    sys.stdout.flush()
 
 
 if __name__ == "__main__":
