@@ -177,6 +177,23 @@ def create_actual_models(device: torch.device):
         sys.stdout.flush()
         
         # ====================================================================
+        # Multi-GPU Support (DataParallel)
+        # ====================================================================
+        if torch.cuda.device_count() > 1:
+            print(f"\n    📊 Multi-GPU Support Detected!")
+            print(f"       Available GPUs: {torch.cuda.device_count()}")
+            sys.stdout.flush()
+            
+            # Wrap models with DataParallel for multi-GPU training
+            generator = torch.nn.DataParallel(generator)
+            discriminator = torch.nn.DataParallel(discriminator)
+            
+            print(f"    ✅ Generator wrapped with DataParallel")
+            print(f"    ✅ Discriminator wrapped with DataParallel")
+            print(f"       Training will use all {torch.cuda.device_count()} GPUs")
+            sys.stdout.flush()
+        
+        # ====================================================================
         # Validate Models
         # ====================================================================
         assert generator is not None, "Generator initialization failed!"
