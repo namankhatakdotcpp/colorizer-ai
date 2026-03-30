@@ -323,7 +323,7 @@ def main():
         logger.info(f"   Created: {target_path}")
     
     # Create dataset
-    dataset = ColorizerDataset(args.colorized_dir, args.target_dir, max_samples=100)
+    dataset = ColorizerDataset(args.colorized_dir, args.target_dir, max_samples=None)  # Use all available images
     
     if len(dataset) == 0:
         logger.error("❌ Dataset is empty!")
