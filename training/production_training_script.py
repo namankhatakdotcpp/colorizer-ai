@@ -49,6 +49,23 @@ from training.gan_training_refactored import (
     TrainingConfig,
 )
 
+# ============================================================================
+# Import Actual Project Models
+# ============================================================================
+print("\n🔴 [CHECKPOINT 2B] IMPORTING ACTUAL MODELS")
+try:
+    from models.gan_generator import GANGenerator
+    from models.gan_discriminator import MultiscaleDiscriminator
+    print(f"    ✅ GANGenerator imported from models.gan_generator")
+    print(f"    ✅ MultiscaleDiscriminator imported from models.gan_discriminator")
+    sys.stdout.flush()
+except ImportError as e:
+    print(f"    ❌ IMPORT ERROR: {e}")
+    print(f"       Please ensure models directory is in Python path")
+    import traceback
+    traceback.print_exc()
+    sys.exit(1)
+
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
@@ -104,6 +121,81 @@ class ColorizerDataset(Dataset):
         return colorized, target
 
 
+def create_actual_models(device: torch.device):
+    """
+    Create actual GANGenerator and MultiscaleDiscriminator models.
+    
+    These are production models used for image colorization refinement.
+    
+    Args:
+        device: torch.device (cuda or cpu)
+    
+    Returns:
+        Tuple of (generator, discriminator) both on the specified device
+    """
+    print("\n🔴 [CHECKPOINT MODEL INIT] CREATING ACTUAL MODELS")
+    sys.stdout.flush()
+    
+    try:
+        # ====================================================================
+        # Initialize Generator
+        # ====================================================================
+        print("    Creating GANGenerator...")
+        sys.stdout.flush()
+        
+        generator = GANGenerator(
+            in_channels=3,              # Input: RGB
+            out_channels=3,             # Output: RGB
+            base_filters=64,
+            num_residual_blocks=4,
+        )
+        generator = generator.to(device)
+        
+        gen_params = sum(p.numel() for p in generator.parameters())
+        print(f"    ✅ GANGenerator created")
+        print(f"       Parameters: {gen_params:,}")
+        print(f"       Device: {device}")
+        sys.stdout.flush()
+        
+        # ====================================================================
+        # Initialize Discriminator
+        # ====================================================================
+        print("    Creating MultiscaleDiscriminator...")
+        sys.stdout.flush()
+        
+        discriminator = MultiscaleDiscriminator(
+            in_channels=4,              # L_channel + RGB
+            base_filters=64,
+            num_scales=3,               # original, 1/2, 1/4
+        )
+        discriminator = discriminator.to(device)
+        
+        disc_params = sum(p.numel() for p in discriminator.parameters())
+        print(f"    ✅ MultiscaleDiscriminator created")
+        print(f"       Parameters: {disc_params:,}")
+        print(f"       Device: {device}")
+        sys.stdout.flush()
+        
+        # ====================================================================
+        # Validate Models
+        # ====================================================================
+        assert generator is not None, "Generator initialization failed!"
+        assert discriminator is not None, "Discriminator initialization failed!"
+        
+        print(f"\n    ✅ Both models successfully initialized")
+        print(f"       Total parameters: {gen_params + disc_params:,}")
+        sys.stdout.flush()
+        
+        return generator, discriminator
+    
+    except Exception as e:
+        print(f"\n    ❌ ERROR creating models: {e}")
+        import traceback
+        traceback.print_exc()
+        sys.stdout.flush()
+        raise
+
+
 def compute_fid(trainer: RefactoredGANTrainer, val_loader: DataLoader, device: torch.device) -> float:
     """
     Compute FID score (placeholder).
@@ -112,60 +204,6 @@ def compute_fid(trainer: RefactoredGANTrainer, val_loader: DataLoader, device: t
     """
     import random
     return 50.0 + random.random() * 5
-
-
-def create_dummy_models(device: torch.device):
-    """Create dummy models for testing. Replace with your actual models."""
-    
-    class DummyGenerator(nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.model = nn.Sequential(
-                nn.Conv2d(1, 64, 3, padding=1),
-                nn.ReLU(),
-                nn.Conv2d(64, 128, 3, padding=1),
-                nn.ReLU(),
-                nn.Conv2d(128, 3, 3, padding=1),
-            )
-        
-        def forward(self, x):
-            return self.model(x)
-    
-    class DummyDiscriminator(nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.model = nn.Sequential(
-                nn.Conv2d(4, 64, 4, stride=2, padding=1),  # L + RGB = 4 channels
-                nn.LeakyReLU(0.2),
-                nn.Conv2d(64, 128, 4, stride=2, padding=1),
-                nn.LeakyReLU(0.2),
-                nn.Conv2d(128, 1, 3, padding=1),
-            )
-        
-        def forward(self, x):
-            return self.model(x), None  # (logits, features)
-    
-    generator = DummyGenerator().to(device)
-    discriminator = DummyDiscriminator().to(device)
-    
-    logger.info("⚠️  Using dummy models - replace with your actual models!")
-    return generator, discriminator
-
-
-def compute_loss(real_output, fake_output, real_images, fake_images, target):
-    """Simple loss computation."""
-    if real_output is None or fake_output is None:
-        return torch.tensor(0.0, device=real_images.device)
-    
-    # Adversarial loss
-    real_loss = torch.nn.functional.binary_cross_entropy_with_logits(
-        real_output, torch.ones_like(real_output)
-    )
-    fake_loss = torch.nn.functional.binary_cross_entropy_with_logits(
-        fake_output, torch.zeros_like(fake_output)
-    )
-    
-    return (real_loss + fake_loss) / 2
 
 
 def main():
@@ -246,7 +284,7 @@ def main():
     print("📦 Loading models...")
     sys.stdout.flush()
     
-    generator, discriminator = create_dummy_models(device)
+    generator, discriminator = create_actual_models(device)
     
     logger.info(f"✅ Generator: {generator.__class__.__name__}")
     logger.info(f"✅ Discriminator: {discriminator.__class__.__name__}")
