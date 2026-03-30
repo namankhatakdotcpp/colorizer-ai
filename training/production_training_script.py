@@ -449,10 +449,18 @@ def main():
             if d_logits is None:
                 return torch.tensor(0.0), {}
             
-            # Simple binary cross-entropy loss
-            fake_loss = torch.nn.functional.binary_cross_entropy_with_logits(
-                d_logits, torch.zeros_like(d_logits)
-            )
+            # Handle multiscale discriminator output (list of tensors)
+            if isinstance(d_logits, (list, tuple)):
+                fake_loss = sum(
+                    torch.nn.functional.binary_cross_entropy_with_logits(
+                        logit, torch.zeros_like(logit)
+                    ) for logit in d_logits
+                ) / len(d_logits)  # average across scales
+            else:
+                fake_loss = torch.nn.functional.binary_cross_entropy_with_logits(
+                    d_logits, torch.zeros_like(d_logits)
+                )
+            
             return fake_loss, {"d_loss": fake_loss.item()}
     
     loss_manager = SimpleLossManager()
@@ -554,6 +562,10 @@ def main():
             
             with tqdm(total=len(train_loader), desc="Training", leave=False) as pbar:
                 for batch_idx, (condition, target) in enumerate(train_loader):
+                    
+                    # Move batch to device
+                    condition = condition.to(device)
+                    target = target.to(device)
                     
                     # ========================================================
                     # DEBUG: First batch
