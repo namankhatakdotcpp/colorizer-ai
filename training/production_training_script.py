@@ -100,12 +100,12 @@ class ColorizerDataset(Dataset):
         return len(self.colorized_files)
     
     def __getitem__(self, idx):
-        # Load images
-        colorized = Image.open(self.colorized_files[idx]).convert('L')  # L channel
-        target = Image.open(self.target_files[idx]).convert('RGB')       # RGB
+        # Load images and convert to RGB for consistency
+        colorized = Image.open(self.colorized_files[idx]).convert('RGB')  # Convert to RGB (3 channels)
+        target = Image.open(self.target_files[idx]).convert('RGB')         # RGB
         
-        # Convert to tensors
-        colorized = torch.tensor(np.array(colorized), dtype=torch.float32).unsqueeze(0) / 255.0
+        # Convert to tensors (both now have 3 channels)
+        colorized = torch.tensor(np.array(colorized), dtype=torch.float32).permute(2, 0, 1) / 255.0
         target = torch.tensor(np.array(target), dtype=torch.float32).permute(2, 0, 1) / 255.0
         
         # Ensure consistent size
@@ -164,7 +164,7 @@ def create_actual_models(device: torch.device):
         sys.stdout.flush()
         
         discriminator = MultiscaleDiscriminator(
-            in_channels=4,              # L_channel + RGB
+            in_channels=6,              # RGB condition + RGB target = 6 channels
             base_filters=64,
             num_scales=3,               # original, 1/2, 1/4
         )
