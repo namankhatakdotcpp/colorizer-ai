@@ -667,8 +667,12 @@ def main():
         
         trend = checkpoint_manager.get_fid_trend()
         
+        # Safety check: use fallback values if keys missing
+        best_fid = trend.get('best_fid', fid_score)
+        best_epoch = trend.get('best_epoch', epoch)
+        
         status = "🏆 NEW BEST!" if is_best else "✅ Saved"
-        print(f"  {status} Best FID: {trend['best_fid']:.3f} (epoch {trend['best_epoch']})")
+        print(f"  {status} Best FID: {best_fid:.3f} (epoch {best_epoch})")
         sys.stdout.flush()
     
     # ========================================================================
@@ -683,8 +687,11 @@ def main():
     best_path = checkpoint_manager.get_best_model_path()
     trend = checkpoint_manager.get_fid_trend()
     
+    # Safety check: use fallback values if keys missing
+    best_fid = trend.get('best_fid', fid_score if 'fid_score' in locals() else 999.0)
+    
     print(f"✅ Best model: {best_path}")
-    print(f"✅ Best FID: {trend['best_fid']:.3f}")
+    print(f"✅ Best FID: {best_fid:.3f}")
     print(f"✅ Total epochs: {args.num_epochs}")
     print(f"✅ Checkpoints saved: {len(checkpoint_manager.fid_history)}\n")
     sys.stdout.flush()
@@ -718,8 +725,13 @@ def main():
     print("\n" + "="*80)
     print("🔴 [CHECKPOINT 8] TRAINING SCRIPT COMPLETED SUCCESSFULLY")
     print("="*80)
-    print(f"    Best FID: {trend['best_fid']:.3f}")
-    print(f"    Best epoch: {trend['best_epoch']}")
+    
+    # Safety check: use fallback values if keys missing
+    best_fid = trend.get('best_fid', 999.0)
+    best_epoch = trend.get('best_epoch', args.num_epochs - 1)
+    
+    print(f"    Best FID: {best_fid:.3f}")
+    print(f"    Best epoch: {best_epoch}")
     print(f"    Total checkpoints: {len(checkpoint_manager.fid_history)}")
     print(f"    Summary saved: {summary_file}")
     print("="*80 + "\n")
