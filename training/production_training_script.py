@@ -104,19 +104,13 @@ class ColorizerDataset(Dataset):
         colorized = Image.open(self.colorized_files[idx]).convert('RGB')  # Convert to RGB (3 channels)
         target = Image.open(self.target_files[idx]).convert('RGB')         # RGB
         
+        # Force resize to fixed size - THIS IS THE KEY FIX
+        colorized = colorized.resize((256, 256), Image.BILINEAR)
+        target = target.resize((256, 256), Image.BILINEAR)
+        
         # Convert to tensors (both now have 3 channels)
         colorized = torch.tensor(np.array(colorized), dtype=torch.float32).permute(2, 0, 1) / 255.0
         target = torch.tensor(np.array(target), dtype=torch.float32).permute(2, 0, 1) / 255.0
-        
-        # Ensure consistent size
-        if colorized.shape[1] > 256 or colorized.shape[2] > 256:
-            # Resize to 256x256 if too large
-            colorized = torch.nn.functional.interpolate(
-                colorized.unsqueeze(0), size=(256, 256), mode='bilinear', align_corners=False
-            ).squeeze(0)
-            target = torch.nn.functional.interpolate(
-                target.unsqueeze(0), size=(256, 256), mode='bilinear', align_corners=False
-            ).squeeze(0)
         
         return colorized, target
 
