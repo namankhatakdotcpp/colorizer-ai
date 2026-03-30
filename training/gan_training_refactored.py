@@ -99,7 +99,8 @@ class ExponentialMovingAverage(nn.Module):
         # Store shadow parameters
         for name, param in model.named_parameters():
             if param.requires_grad:
-                self.register_buffer(f"shadow_{name}", param.data.clone())
+                safe_name = name.replace(".", "_")  # PyTorch doesn't allow dots in buffer names
+                self.register_buffer(f"shadow_{safe_name}", param.data.clone())
 
     def update(self):
         """Update EMA weights."""
@@ -109,14 +110,16 @@ class ExponentialMovingAverage(nn.Module):
         with torch.no_grad():
             for name, param in self.model.named_parameters():
                 if param.requires_grad:
-                    shadow = getattr(self, f"shadow_{name}")
+                    safe_name = name.replace(".", "_")  # Match the safe name used in __init__
+                    shadow = getattr(self, f"shadow_{safe_name}")
                     shadow.copy_(decay * shadow + (1 - decay) * param.data)
 
     def set_to_shadow(self):
         """Switch model to use EMA weights (for evaluation)."""
         for name, param in self.model.named_parameters():
             if param.requires_grad:
-                shadow = getattr(self, f"shadow_{name}")
+                safe_name = name.replace(".", "_")  # Match the safe name used in __init__
+                shadow = getattr(self, f"shadow_{safe_name}")
                 self._original_weights = {n: p.data.clone() 
                                          for n, p in self.model.named_parameters()}
                 param.data.copy_(shadow)
