@@ -179,6 +179,44 @@ def fft_loss(fake: torch.Tensor, real: torch.Tensor) -> torch.Tensor:
     return torch.mean(torch.abs(fake_mag - real_mag))
 
 
+def color_histogram_loss(fake: torch.Tensor, real: torch.Tensor, num_bins: int = 32) -> torch.Tensor:
+    """
+    Color histogram matching loss - aligns RGB distribution between fake and real.
+    
+    Encourages generator to match the color distribution of target images,
+    improving perceptual quality and reducing color shifts.
+
+    Args:
+        fake: Generated image, shape (B, 3, H, W), range [-1, 1]
+        real: Target image, shape (B, 3, H, W), range [-1, 1]
+        num_bins: Number of histogram bins
+
+    Returns:
+        Histogram matching loss value
+    """
+    # Convert from [-1, 1] to [0, 1] for histogram calculation
+    fake_norm = (fake + 1.0) / 2.0
+    real_norm = (real + 1.0) / 2.0
+    
+    loss = torch.tensor(0.0, device=fake.device)
+    
+    # Compute histogram loss for each RGB channel
+    for c in range(3):
+        # Compute histograms for each image in batch
+        fake_hist = torch.histogram(fake_norm[:, c, :, :].flatten(), bins=num_bins, range=(0.0, 1.0)).hist
+        real_hist = torch.histogram(real_norm[:, c, :, :].flatten(), bins=num_bins, range=(0.0, 1.0)).hist
+        
+        # Normalize histograms
+        fake_hist = fake_hist / (fake_hist.sum() + 1e-8)
+        real_hist = real_hist / (real_hist.sum() + 1e-8)
+        
+        # L2 distance between histograms
+        channel_loss = torch.sqrt(torch.sum((fake_hist - real_hist) ** 2) + 1e-8)
+        loss = loss + channel_loss
+    
+    return loss / 3.0  # Average over channels
+
+
 class ImageRefinementDataset(Dataset):
     """Dataset for reading colorized and target images."""
 
@@ -308,33 +346,46 @@ class GANRefinementTrainer:
     def __init__(
         self,
         device: torch.device = None,
-        learning_rate_g: float = 0.0002,
-        learning_rate_d: float = 0.0002,
-        lambda_l1: float = 100.0,
+        learning_rate_g: float = 1e-4,
+        learning_rate_d: float = 2e-4,
+        lambda_l1: float = 50.0,
         lambda_perceptual: float = 10.0,
         lambda_adversarial: float = 1.0,
+        lambda_feature_matching: float = 10.0,
+        lambda_histogram: float = 5.0,
+        n_critic: int = 2,
     ):
         """
-        Initialize trainer.
+        Initialize trainer with production-grade settings.
 
         Args:
             device: Device to use (cuda or cpu)
-            learning_rate_g: Learning rate for generator
-            learning_rate_d: Learning rate for discriminator
-            lambda_l1: Weight for L1 loss
+            learning_rate_g: Learning rate for generator (TTUR: lower)
+            learning_rate_d: Learning rate for discriminator (TTUR: higher, 2x G)
+            lambda_l1: Weight for L1 reconstruction loss
             lambda_perceptual: Weight for perceptual loss
             lambda_adversarial: Weight for adversarial loss
+            lambda_feature_matching: Weight for feature matching loss
+            lambda_histogram: Weight for color histogram loss
+            n_critic: Number of discriminator updates per generator update
         """
         self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+        # TTUR: Two Time-Scale Update Rule for stable training
         self.learning_rate_g = learning_rate_g
         self.learning_rate_d = learning_rate_d
+        self.n_critic = n_critic  # Discriminator update frequency
 
+        # Loss weights (production-grade configuration)
         self.lambda_l1 = lambda_l1
         self.lambda_perceptual = lambda_perceptual
         self.lambda_adversarial = lambda_adversarial
+        self.lambda_feature_matching = lambda_feature_matching
+        self.lambda_histogram = lambda_histogram
 
         logger.info(f"Using device: {self.device}")
+        logger.info(f"TTUR enabled: G_lr={learning_rate_g:.2e}, D_lr={learning_rate_d:.2e} (ratio 1:{learning_rate_d/learning_rate_g:.1f})")
+        logger.info(f"n_critic={n_critic} (D updates per G update)")
 
         # Build models
         self.generator = GANGenerator(
@@ -365,6 +416,10 @@ class GANRefinementTrainer:
         self.adversarial_loss = nn.BCEWithLogitsLoss()
         self.l1_loss = nn.L1Loss()
         
+        # Label smoothing for stability (standard GAN tech)
+        self.real_label_smooth = 0.9  # Real labels: 0.9 instead of 1.0
+        self.fake_label = 0.1         # Fake labels: 0.1 instead of 0.0
+        
         # Mixed Precision Training (AMP)
         self.scaler = torch.amp.GradScaler('cuda') if torch.cuda.is_available() else None
 
@@ -377,7 +432,7 @@ class GANRefinementTrainer:
             self.perceptual_loss = None
             self.use_perceptual = False
 
-        # Optimizers
+        # Optimizers with TTUR (different learning rates)
         self.optimizer_g = optim.Adam(
             self.generator.parameters(),
             lr=learning_rate_g,
@@ -390,18 +445,20 @@ class GANRefinementTrainer:
             betas=(0.5, 0.999),
         )
 
+        # Production-grade loss tracking
         self.training_history = {
             "epoch": [],
-            "loss_g": [],
-            "loss_d": [],
-            "loss_l1": [],
-            "loss_perceptual": [],
-            "loss_adversarial": [],
-            "loss_identity": [],
+            "loss_g_total": [],
+            "loss_d_total": [],
+            "loss_g_adv": [],
+            "loss_g_l1": [],
+            "loss_g_perceptual": [],
+            "loss_g_feature_matching": [],
+            "loss_g_histogram": [],
+            "loss_d_real": [],
+            "loss_d_fake": [],
             "loss_r1": [],
-            "loss_path_length": [],  # NEW
-            "loss_fft": [],           # NEW
-            "loss_style": [],         # NEW
+            "grad_ratio": [],  # G gradient / D gradient ratio
         }
         
         self.d_steps = 0  # Track discriminator steps for R1 penalty
@@ -430,15 +487,16 @@ class GANRefinementTrainer:
         device = colorized.device
 
         losses_dict = {
-            "loss_g": [],
-            "loss_d": [],
-            "loss_l1": [],
-            "loss_perceptual": [],
-            "loss_adversarial": [],
-            "loss_feature_matching": [],
-            "loss_identity": [],
+            "loss_g_total": [],
+            "loss_d_total": [],
+            "loss_g_adv": [],
+            "loss_g_l1": [],
+            "loss_g_perceptual": [],
+            "loss_g_feature_matching": [],
+            "loss_g_histogram": [],
+            "loss_d_real": [],
+            "loss_d_fake": [],
             "loss_r1": [],
-            "loss_fft": [],
         }
 
         # ============== Discriminator Step (multiple times) ==============
@@ -472,14 +530,19 @@ class GANRefinementTrainer:
             real_conditional = torch.cat([L_expanded, real_noisy_for_grad], dim=1)  # 4 channels: 1 (L) + 3 (RGB)
             fake_conditional = torch.cat([L_expanded, fake_noisy], dim=1)  # 4 channels: 1 (L) + 3 (RGB)
 
-            # Discriminator outputs (multi-scale)
+            # Discriminator outputs (multi-scale with intermediate features)
             with torch.amp.autocast('cuda', enabled=self.scaler is not None):
-                disc_real = self.discriminator(real_conditional)
-                disc_fake = self.discriminator(fake_conditional)
+                disc_real_logits, disc_real_features = self.discriminator(real_conditional)
+                disc_fake_logits, disc_fake_features = self.discriminator(fake_conditional)
 
-            # Hinge loss for discriminator (more stable than BCE)
-            loss_d_real = torch.mean(nn.ReLU()(1.0 - disc_real[0]))
-            loss_d_fake = torch.mean(nn.ReLU()(1.0 + disc_fake[0]))
+            # ===== DISCRIMINATOR LOSS WITH LABEL SMOOTHING =====
+            # Label smoothing: real=0.9, fake=0.1 (prevents discriminator collapse)
+            real_labels = torch.full_like(disc_real_logits[0], self.real_label_smooth)
+            fake_labels = torch.full_like(disc_fake_logits[0], self.fake_label)
+            
+            # BCE loss with label smoothing for stability
+            loss_d_real = self.adversarial_loss(disc_real_logits[0], real_labels)
+            loss_d_fake = self.adversarial_loss(disc_fake_logits[0], fake_labels)
             
             # Compute D loss WITHOUT R1 first
             loss_d = loss_d_real + loss_d_fake
@@ -493,11 +556,11 @@ class GANRefinementTrainer:
                 real_cond_r1 = torch.cat([L_for_r1, real_for_r1], dim=1)
                 
                 with torch.amp.autocast('cuda', enabled=self.scaler is not None):
-                    disc_real_r1 = self.discriminator(real_cond_r1)
+                    disc_real_r1_logits, _ = self.discriminator(real_cond_r1)
                 
                 # R1 backward separately
                 r1_grad = torch.autograd.grad(
-                    outputs=disc_real_r1[0].sum(),
+                    outputs=disc_real_r1_logits[0].sum(),
                     inputs=real_for_r1,
                     create_graph=False,
                     retain_graph=False,
@@ -579,6 +642,9 @@ class GANRefinementTrainer:
             if self.use_perceptual and self.perceptual_loss is not None:
                 loss_perceptual = self.perceptual_loss(refined_g, target_g.detach())
 
+            # Color histogram loss: match RGB distribution 
+            loss_histogram = color_histogram_loss(refined_g, target_g)
+
             # FFT Loss: Frequency domain matching
             fft_fake = torch.fft.rfft2(refined_g.float())
             fft_real = torch.fft.rfft2(target_g.float())
@@ -592,10 +658,11 @@ class GANRefinementTrainer:
             # 1️⃣ ADVERSARIAL LOSS (STANDARD GAN MATH)
             # --------------------------------------------------------
             # 🔥 ONLY ONE D forward in entire G step
-            disc_fake = self.discriminator(refined_conditional)[0]
+            disc_fake_logits, disc_fake_g_features = self.discriminator(refined_conditional)
             
             # 💯 Standard adversarial loss (no hacks, just correct math)
-            loss_adv_g = -disc_fake.mean()
+            # Use first scale's logits for adversarial loss
+            loss_adv_g = -disc_fake_logits[0].mean()
 
             # --------------------------------------------------------
             # 2️⃣ FEATURE MATCHING (NO GRAPH - COMPLETELY ISOLATED)
@@ -605,18 +672,23 @@ class GANRefinementTrainer:
             # 🔥 CRITICAL: Entire FM computation inside no_grad()
             # This prevents ANY graph building from interfering with adversarial loss
             with torch.no_grad():
-                # Fake features (no gradients)
+                # Fake features (no gradients) - extract intermediate features
                 # 💥 CRITICAL: Detach refined_conditional to break graph leak
-                disc_fake_fm = self.discriminator(refined_conditional.detach())
-                fake_features = disc_fake_fm[1:] if isinstance(disc_fake_fm, (list, tuple)) and len(disc_fake_fm) > 1 else []
+                disc_fake_fm_logits, disc_fake_fm_features = self.discriminator(refined_conditional.detach())
+                # Flatten multi-scale features for matching
+                fake_features = []
+                for scale_features in disc_fake_fm_features:
+                    fake_features.extend(scale_features)
                 
                 # Real features (no gradients)
                 real_noisy_g = target_g + 0.05 * torch.randn_like(target_g)
                 real_noisy_g = torch.clamp(real_noisy_g, -1.0, 1.0)
                 real_conditional_g = torch.cat([L_expanded_g, real_noisy_g], dim=1)
                 # 💥 CRITICAL: Detach real_conditional_g to break graph leak
-                disc_real_fm = self.discriminator(real_conditional_g.detach())
-                real_features = disc_real_fm[1:] if isinstance(disc_real_fm, (list, tuple)) and len(disc_real_fm) > 1 else []
+                disc_real_fm_logits, disc_real_fm_features = self.discriminator(real_conditional_g.detach())
+                real_features = []
+                for scale_features in disc_real_fm_features:
+                    real_features.extend(scale_features)
                 
                 # Compute FM loss (no gradients at all)
                 if fake_features and real_features:
@@ -625,15 +697,16 @@ class GANRefinementTrainer:
                         fm_loss_total += torch.mean(torch.abs(fake_feat - real_feat))
                     loss_fm = fm_loss_total / max(len(real_features), 1)
             
-            # ===== COMBINE ALL LOSSES INTO SINGLE SCALAR =====
-            # Only loss_adv_g has graph; others are constants
+            # ===== COMBINE ALL LOSSES WITH PRODUCTION WEIGHTS =====
+            # Loss combination: adversarial (for fooling D), + reconstruction (content fidelity)
+            # + perceptual (feature space), + feature matching (discriminator features),
+            # + histogram (color distribution), + FFT (frequency domain)
             loss_g = (
-                self.lambda_adversarial * loss_adv_g +
-                self.lambda_l1 * loss_l1 +
-                2.0 * loss_identity +
-                self.lambda_perceptual * loss_perceptual +
-                5.0 * loss_fm +
-                0.05 * loss_fft
+                self.lambda_adversarial * loss_adv_g +        # GAN: 1.0
+                self.lambda_l1 * loss_l1 +                    # L1: 50.0 (content)
+                self.lambda_perceptual * loss_perceptual +    # Perceptual: 10.0
+                self.lambda_feature_matching * loss_fm +      # Feature Matching: 10.0
+                self.lambda_histogram * loss_histogram        # Histogram: 5.0
             )
 
         # 🔥 SAFETY ASSERTIONS: Verify complete graph isolation (no debug output)
@@ -675,13 +748,16 @@ class GANRefinementTrainer:
             for param, ema_param in zip(self.generator.parameters(), self.generator_ema.parameters()):
                 ema_param.data = self.ema_decay * ema_param.data + (1 - self.ema_decay) * param.data
 
-        losses_dict["loss_g"].append(loss_g.item())
-        losses_dict["loss_l1"].append(loss_l1.item())
-        losses_dict["loss_perceptual"].append(loss_perceptual.item() if isinstance(loss_perceptual, torch.Tensor) else 0.0)
-        losses_dict["loss_adversarial"].append(loss_adv_g.item())
-        losses_dict["loss_feature_matching"].append(loss_fm.item() if isinstance(loss_fm, torch.Tensor) else 0.0)
-        losses_dict["loss_identity"].append(loss_identity.item())
-        losses_dict["loss_fft"].append(loss_fft.item() if isinstance(loss_fft, torch.Tensor) else 0.0)
+        losses_dict["loss_g_total"].append(loss_g.item())
+        losses_dict["loss_d_total"].append(loss_d.item())
+        losses_dict["loss_g_adv"].append(loss_adv_g.item() if isinstance(loss_adv_g, torch.Tensor) else 0.0)
+        losses_dict["loss_g_l1"].append(loss_l1.item() if isinstance(loss_l1, torch.Tensor) else 0.0)
+        losses_dict["loss_g_perceptual"].append(loss_perceptual.item() if isinstance(loss_perceptual, torch.Tensor) else 0.0)
+        losses_dict["loss_g_feature_matching"].append(loss_fm.item() if isinstance(loss_fm, torch.Tensor) else 0.0)
+        losses_dict["loss_g_histogram"].append(loss_histogram.item() if isinstance(loss_histogram, torch.Tensor) else 0.0)
+        losses_dict["loss_d_real"].append(loss_d_real.item() if isinstance(loss_d_real, torch.Tensor) else 0.0)
+        losses_dict["loss_d_fake"].append(loss_d_fake.item() if isinstance(loss_d_fake, torch.Tensor) else 0.0)
+        losses_dict["loss_r1"].append(loss_r1.item() if isinstance(loss_r1, torch.Tensor) else 0.0)
 
         # Average all losses
         return {
@@ -950,13 +1026,16 @@ def main():
         num_workers=args.num_workers,
     )
 
-    # Create trainer
+    # Create trainer with production-grade settings (TTUR)
     trainer = GANRefinementTrainer(
         device=device,
-        learning_rate_g=args.learning_rate_g,
-        learning_rate_d=args.learning_rate_d,
-        lambda_l1=args.lambda_l1,
+        learning_rate_g=args.learning_rate_g if args.learning_rate_g != 0.0002 else 1e-4,  # TTUR: 1e-4
+        learning_rate_d=args.learning_rate_d if args.learning_rate_d != 0.0002 else 2e-4,  # TTUR: 2e-4
+        lambda_l1=args.lambda_l1 if args.lambda_l1 != 100.0 else 50.0,  # Updated: 50.0
         lambda_perceptual=args.lambda_perceptual,
+        lambda_feature_matching=10.0,
+        lambda_histogram=5.0,
+        n_critic=2,
     )
 
     start_epoch = 0
@@ -986,10 +1065,16 @@ def main():
 
         logger.info(
             f"Epoch {epoch + 1}/{args.num_epochs} - "
-            f"G: {losses['loss_g']:.4f} | "
-            f"D: {losses['loss_d']:.4f} | "
-            f"L1: {losses['loss_l1']:.4f} | "
-            f"Perc: {losses['loss_perceptual']:.4f}"
+            f"G_total: {losses['loss_g_total']:.4f} | "
+            f"D_total: {losses['loss_d_total']:.4f} | "
+            f"G_adv: {losses['loss_g_adv']:.4f} | "
+            f"G_l1: {losses['loss_g_l1']:.4f} | "
+            f"G_perceptual: {losses['loss_g_perceptual']:.4f} | "
+            f"G_fm: {losses['loss_g_feature_matching']:.4f} | "
+            f"G_hist: {losses['loss_g_histogram']:.4f} | "
+            f"D_real: {losses['loss_d_real']:.4f} | "
+            f"D_fake: {losses['loss_d_fake']:.4f} | "
+            f"R1: {losses['loss_r1']:.6f}"
         )
 
         # Save sample images every epoch
