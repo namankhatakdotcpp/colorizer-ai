@@ -453,8 +453,28 @@ def main():
     print("🤖 Creating trainer...")
     sys.stdout.flush()
     
+    # ========================================================================
+    # VGG PERCEPTUAL LOSS
+    # ========================================================================
+    class VGGPerceptualLoss(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            import torchvision.models as models
+            vgg = models.vgg16(pretrained=True).features[:16]
+            self.vgg = vgg.eval()
+            for p in self.vgg.parameters():
+                p.requires_grad = False
+        
+        def forward(self, pred, target):
+            return torch.nn.functional.l1_loss(self.vgg(pred), self.vgg(target))
+    
     # Simple loss manager (replace with your actual loss manager)
     class SimpleLossManager:
+        def __init__(self, device):
+            self.lambda_fm = 2.0  # Feature matching weight
+            self.perceptual_loss = VGGPerceptualLoss().to(device)
+            self.device = device
+        
         def __call__(self, **kwargs):
             d_logits = kwargs.get('disc_fake_logits')
             if d_logits is None:
@@ -472,9 +492,16 @@ def main():
                     d_logits, torch.zeros_like(d_logits)
                 )
             
+            # Add perceptual loss if available
+            generated = kwargs.get('generated')
+            target = kwargs.get('target')
+            if generated is not None and target is not None:
+                perc_loss = self.perceptual_loss(generated, target)
+                fake_loss = fake_loss + 0.1 * perc_loss
+            
             return fake_loss, {"d_loss": fake_loss.item()}
     
-    loss_manager = SimpleLossManager()
+    loss_manager = SimpleLossManager(device)
     
     trainer = RefactoredGANTrainer(
         generator=generator,
@@ -486,6 +513,20 @@ def main():
     
     logger.info("✅ Trainer created successfully")
     print("✅ Trainer created successfully")
+    sys.stdout.flush()
+    
+    # ========================================================================
+    # LEARNING RATE SCHEDULERS (Cosine Annealing)
+    # ========================================================================
+    scheduler_g = torch.optim.lr_scheduler.CosineAnnealingLR(
+        trainer.optimizer_g, T_max=30, eta_min=1e-6
+    )
+    scheduler_d = torch.optim.lr_scheduler.CosineAnnealingLR(
+        trainer.optimizer_d, T_max=30, eta_min=1e-6
+    )
+    
+    print("📈 Learning rate schedulers created (CosineAnnealingLR)")
+    print(f"    T_max: 30, eta_min: 1e-6")
     sys.stdout.flush()
     
     # ========================================================================
@@ -684,6 +725,17 @@ def main():
         
         status = "🏆 NEW BEST!" if is_best else "✅ Saved"
         print(f"  {status} Best FID: {best_fid:.3f} (epoch {best_epoch})")
+        sys.stdout.flush()
+        
+        # ====================================================================
+        # LEARNING RATE SCHEDULING
+        # ====================================================================
+        scheduler_g.step()
+        scheduler_d.step()
+        
+        current_lr_g = scheduler_g.get_last_lr()[0]
+        current_lr_d = scheduler_d.get_last_lr()[0]
+        print(f"  Learning rates - G: {current_lr_g:.2e}, D: {current_lr_d:.2e}")
         sys.stdout.flush()
     
     # ========================================================================
