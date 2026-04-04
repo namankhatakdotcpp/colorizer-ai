@@ -491,6 +491,9 @@ class GANRefinementTrainer:
             "loss_g": [],
             "loss_r1": [],
         }
+        
+        # DEBUG: Verify initialization
+        print("DEBUG losses_dict initialized with keys:", losses_dict.keys())
 
         # ============== Discriminator Step (multiple times) ==============
         for d_iter in range(train_d_steps):
@@ -603,6 +606,11 @@ class GANRefinementTrainer:
             # Ensures D parameters are completely clean before G step
             self.optimizer_d.zero_grad(set_to_none=True)
 
+            if "loss_d" not in losses_dict:
+                losses_dict["loss_d"] = []
+            if "loss_r1" not in losses_dict:
+                losses_dict["loss_r1"] = []
+            
             losses_dict["loss_d"].append(loss_d.item())
             losses_dict["loss_r1"].append(loss_r1.item() if isinstance(loss_r1, torch.Tensor) else 0.0)
 
@@ -741,6 +749,13 @@ class GANRefinementTrainer:
             for param, ema_param in zip(self.generator.parameters(), self.generator_ema.parameters()):
                 ema_param.data = self.ema_decay * ema_param.data + (1 - self.ema_decay) * param.data
 
+        if "loss_g" not in losses_dict:
+            losses_dict["loss_g"] = []
+        if "loss_d" not in losses_dict:
+            losses_dict["loss_d"] = []
+        if "loss_r1" not in losses_dict:
+            losses_dict["loss_r1"] = []
+        
         losses_dict["loss_g"].append(loss_g.item())
         losses_dict["loss_d"].append(loss_d.item())
         losses_dict["loss_r1"].append(loss_r1.item() if isinstance(loss_r1, torch.Tensor) else 0.0)
