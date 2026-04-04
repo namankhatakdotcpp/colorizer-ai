@@ -487,15 +487,8 @@ class GANRefinementTrainer:
         device = colorized.device
 
         losses_dict = {
-            "loss_g_total": [],
-            "loss_d_total": [],
-            "loss_g_adv": [],
-            "loss_g_l1": [],
-            "loss_g_perceptual": [],
-            "loss_g_feature_matching": [],
-            "loss_g_histogram": [],
-            "loss_d_real": [],
-            "loss_d_fake": [],
+            "loss_d": [],
+            "loss_g": [],
             "loss_r1": [],
         }
 
@@ -748,15 +741,8 @@ class GANRefinementTrainer:
             for param, ema_param in zip(self.generator.parameters(), self.generator_ema.parameters()):
                 ema_param.data = self.ema_decay * ema_param.data + (1 - self.ema_decay) * param.data
 
-        losses_dict["loss_g_total"].append(loss_g.item())
-        losses_dict["loss_d_total"].append(loss_d.item())
-        losses_dict["loss_g_adv"].append(loss_adv_g.item() if isinstance(loss_adv_g, torch.Tensor) else 0.0)
-        losses_dict["loss_g_l1"].append(loss_l1.item() if isinstance(loss_l1, torch.Tensor) else 0.0)
-        losses_dict["loss_g_perceptual"].append(loss_perceptual.item() if isinstance(loss_perceptual, torch.Tensor) else 0.0)
-        losses_dict["loss_g_feature_matching"].append(loss_fm.item() if isinstance(loss_fm, torch.Tensor) else 0.0)
-        losses_dict["loss_g_histogram"].append(loss_histogram.item() if isinstance(loss_histogram, torch.Tensor) else 0.0)
-        losses_dict["loss_d_real"].append(loss_d_real.item() if isinstance(loss_d_real, torch.Tensor) else 0.0)
-        losses_dict["loss_d_fake"].append(loss_d_fake.item() if isinstance(loss_d_fake, torch.Tensor) else 0.0)
+        losses_dict["loss_g"].append(loss_g.item())
+        losses_dict["loss_d"].append(loss_d.item())
         losses_dict["loss_r1"].append(loss_r1.item() if isinstance(loss_r1, torch.Tensor) else 0.0)
 
         # Average all losses
