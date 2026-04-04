@@ -486,14 +486,8 @@ class GANRefinementTrainer:
         batch_size = colorized.size(0)
         device = colorized.device
 
-        losses_dict = {
-            "loss_d": [],
-            "loss_g": [],
-            "loss_r1": [],
-        }
-        
-        # DEBUG: Verify initialization
-        print("DEBUG losses_dict initialized with keys:", losses_dict.keys())
+        # Initialize loss tracking for this step (not lists, single values per step)
+        step_losses = {}
 
         # ============== Discriminator Step (multiple times) ==============
         for d_iter in range(train_d_steps):
@@ -606,13 +600,9 @@ class GANRefinementTrainer:
             # Ensures D parameters are completely clean before G step
             self.optimizer_d.zero_grad(set_to_none=True)
 
-            if "loss_d" not in losses_dict:
-                losses_dict["loss_d"] = []
-            if "loss_r1" not in losses_dict:
-                losses_dict["loss_r1"] = []
-            
-            losses_dict["loss_d"].append(loss_d.item())
-            losses_dict["loss_r1"].append(loss_r1.item() if isinstance(loss_r1, torch.Tensor) else 0.0)
+            # Store D step losses (will be overwritten for each d_iter)
+            step_losses["loss_d"] = loss_d.item()
+            step_losses["loss_r1"] = loss_r1.item() if isinstance(loss_r1, torch.Tensor) else 0.0
 
         # ============== Generator Step ==============
         # 🔥 CRITICAL: Freeze discriminator to prevent graph overlap during G step
@@ -749,20 +739,11 @@ class GANRefinementTrainer:
             for param, ema_param in zip(self.generator.parameters(), self.generator_ema.parameters()):
                 ema_param.data = self.ema_decay * ema_param.data + (1 - self.ema_decay) * param.data
 
-        if "loss_g" not in losses_dict:
-            losses_dict["loss_g"] = []
-        if "loss_d" not in losses_dict:
-            losses_dict["loss_d"] = []
-        if "loss_r1" not in losses_dict:
-            losses_dict["loss_r1"] = []
-        
-        losses_dict["loss_g"].append(loss_g.item())
-        losses_dict["loss_d"].append(loss_d.item())
-        losses_dict["loss_r1"].append(loss_r1.item() if isinstance(loss_r1, torch.Tensor) else 0.0)
-
-        # Average all losses
+        # Return single batch losses (not averaged lists)
         return {
-            k: np.mean(v) if v else 0.0 for k, v in losses_dict.items()
+            "loss_d": step_losses.get("loss_d", loss_d.item()),
+            "loss_g": loss_g.item(),
+            "loss_r1": step_losses.get("loss_r1", 0.0)
         }
 
     def train_epoch(self, data_loader: DataLoader) -> Tuple[Dict[str, float], Optional[torch.Tensor]]:
