@@ -511,6 +511,9 @@ class GANRefinementTrainer:
             with torch.no_grad():
                 refined_d = self.generator(colorized)  # NO gradient graph
             
+            # FIX 1: EXPLICIT DETACH for safety
+            refined_d = refined_d.detach()
+            
             # Add small noise to real images for stability (label smoothing + noise)
             real_noisy = target + 0.01 * torch.randn_like(target)  # REDUCED: 0.05 → 0.01 for stability
             real_noisy = torch.clamp(real_noisy, -1.0, 1.0)
@@ -531,8 +534,23 @@ class GANRefinementTrainer:
             real_conditional = torch.cat([L_expanded, real_noisy_for_grad], dim=1)  # 4 channels: 1 (L) + 3 (RGB)
             fake_conditional = torch.cat([L_expanded, fake_noisy], dim=1)  # 4 channels: 1 (L) + 3 (RGB)
 
+            # FIX 2: FORCE INPUT CLAMP before D (safety)
+            fake_conditional = torch.clamp(fake_conditional, -1.0, 1.0)
+            real_conditional = torch.clamp(real_conditional, -1.0, 1.0)
+            
+            # FIX 6: SAFE CONV INPUT CHECK - ensure no NaN/Inf before discriminator
+            if not torch.isfinite(fake_conditional).all():
+                logger.warning("⚠️ Bad input to discriminator (fake_conditional), skipping batch")
+                self.optimizer_d.zero_grad(set_to_none=True)
+                continue
+            if not torch.isfinite(real_conditional).all():
+                logger.warning("⚠️ Bad input to discriminator (real_conditional), skipping batch")
+                self.optimizer_d.zero_grad(set_to_none=True)
+                continue
+
             # Discriminator outputs (multi-scale with intermediate features)
-            with torch.amp.autocast('cuda', enabled=self.scaler is not None):
+            # FIX 3: DISABLE AMP FOR DISCRIMINATOR to prevent NaN in convolution
+            with torch.cuda.amp.autocast(enabled=False):
                 disc_real_logits, disc_real_features = self.discriminator(real_conditional)
                 disc_fake_logits, disc_fake_features = self.discriminator(fake_conditional)
 
@@ -556,7 +574,8 @@ class GANRefinementTrainer:
                 L_for_r1 = L_expanded.detach().clone()
                 real_cond_r1 = torch.cat([L_for_r1, real_for_r1], dim=1)
                 
-                with torch.amp.autocast('cuda', enabled=self.scaler is not None):
+                # FIX 3: DISABLE AMP FOR R1 as well
+                with torch.cuda.amp.autocast(enabled=False):
                     disc_real_r1_logits, _ = self.discriminator(real_cond_r1)
                 
                 # R1 backward separately
@@ -587,6 +606,20 @@ class GANRefinementTrainer:
             # 🔥 NaN DETECTION - Skip if loss is invalid
             if not torch.isfinite(loss_d):
                 logger.warning(f"NaN/Inf in D loss, skipping batch")
+                self.optimizer_d.zero_grad(set_to_none=True)
+                continue
+            
+            # FIX 5: GRADIENT NAN GUARD (CRITICAL) - More robust check before backward
+            if torch.isnan(loss_d) or torch.isinf(loss_d):
+                logger.warning(f"⚠️ Skipping D backward due to NaN/Inf in loss_d")
+                self.optimizer_d.zero_grad(set_to_none=True)
+                continue
+            if torch.isnan(loss_d_real) or torch.isinf(loss_d_real):
+                logger.warning(f"⚠️ Skipping D backward due to NaN/Inf in loss_d_real")
+                self.optimizer_d.zero_grad(set_to_none=True)
+                continue
+            if torch.isnan(loss_d_fake) or torch.isinf(loss_d_fake):
+                logger.warning(f"⚠️ Skipping D backward due to NaN/Inf in loss_d_fake")
                 self.optimizer_d.zero_grad(set_to_none=True)
                 continue
 
@@ -666,9 +699,12 @@ class GANRefinementTrainer:
 
             # ===== SINGLE REFINED CONDITIONAL FOR ALL D FORWARDS =====
             L_expanded_g = L_channel_g.expand(batch_size, -1, -1, -1) if L_channel_g.dim() == 3 else L_channel_g
-            refined_conditional = torch.cat([L_expanded_g, refined_g], dim=1)
+            refined_conditional = torch.cat([L_expanded_g, refined_g.detach()], dim=1)  # FIX 1: Detach refined_g
             
-            # 🔥 FIX 2: SANITY CHECK - Skip if NaN/Inf in input
+            # FIX 2: FORCE CLAMP before D
+            refined_conditional = torch.clamp(refined_conditional, -1.0, 1.0)
+            
+            # FIX 6: SAFE CONV INPUT CHECK - ensure no NaN/Inf before discriminator
             if torch.isnan(refined_conditional).any() or torch.isinf(refined_conditional).any():
                 logger.warning(f"⚠️ Skipping batch (NaN/Inf in refined_conditional)")
                 self.optimizer_g.zero_grad(set_to_none=True)
@@ -691,7 +727,9 @@ class GANRefinementTrainer:
             # 1️⃣ ADVERSARIAL LOSS (STANDARD GAN MATH)
             # --------------------------------------------------------
             # 🔥 ONLY ONE D forward in entire G step
-            disc_fake_logits, disc_fake_g_features = self.discriminator(refined_conditional)
+            # FIX 3: DISABLE AMP FOR DISCRIMINATOR (disable inside autocast context)
+            with torch.cuda.amp.autocast(enabled=False):
+                disc_fake_logits, disc_fake_g_features = self.discriminator(refined_conditional)
             
             # 💯 Standard adversarial loss (BCE - same as discriminator)
             # Use first scale's logits for adversarial loss
@@ -709,7 +747,9 @@ class GANRefinementTrainer:
             with torch.no_grad():
                 # Fake features (no gradients) - extract intermediate features
                 # 💥 CRITICAL: Detach refined_conditional to break graph leak
-                disc_fake_fm_logits, disc_fake_fm_features = self.discriminator(refined_conditional.detach())
+                # FIX 3: DISABLE AMP FOR FM discriminator calls
+                with torch.cuda.amp.autocast(enabled=False):
+                    disc_fake_fm_logits, disc_fake_fm_features = self.discriminator(refined_conditional.detach())
                 # Flatten multi-scale features for matching
                 fake_features = []
                 for scale_features in disc_fake_fm_features:
@@ -720,7 +760,9 @@ class GANRefinementTrainer:
                 real_noisy_g = torch.clamp(real_noisy_g, -1.0, 1.0)
                 real_conditional_g = torch.cat([L_expanded_g, real_noisy_g], dim=1)
                 # 💥 CRITICAL: Detach real_conditional_g to break graph leak
-                disc_real_fm_logits, disc_real_fm_features = self.discriminator(real_conditional_g.detach())
+                # FIX 3: DISABLE AMP FOR FM discriminator calls
+                with torch.cuda.amp.autocast(enabled=False):
+                    disc_real_fm_logits, disc_real_fm_features = self.discriminator(real_conditional_g.detach())
                 real_features = []
                 for scale_features in disc_real_fm_features:
                     real_features.extend(scale_features)
@@ -800,6 +842,26 @@ class GANRefinementTrainer:
             }
         # 🔥 BACKWARD FOR G STEP (ONLY REACHED if loss is valid)
         # This is the ONLY backward on loss_g for this train step
+        
+        # FIX 5: GRADIENT NAN GUARD (CRITICAL) - Verify loss is safe before backward
+        if torch.isnan(loss_g) or torch.isinf(loss_g):
+            logger.warning(f"⚠️ Skipping G backward due to NaN/Inf in loss_g")
+            self.optimizer_g.zero_grad(set_to_none=True)
+            for p in self.discriminator.parameters():
+                p.requires_grad = True
+            return {
+                "loss_d": step_losses.get("loss_d", 0.0),
+                "loss_g": 0.0,
+                "loss_l1": loss_l1.item() if loss_l1 > 0 else 0.0,
+                "loss_identity": loss_identity.item() if loss_identity > 0 else 0.0,
+                "loss_perceptual": loss_perceptual.item() if loss_perceptual > 0 else 0.0,
+                "loss_histogram": loss_histogram.item(),
+                "loss_fft": loss_fft.item(),
+                "loss_fm": loss_fm.item(),
+                "loss_r1": step_losses.get("loss_r1", 0.0),
+                "loss_adv_g": 0.0,
+            }
+        
         if self.scaler is not None:
             self.scaler.scale(loss_g).backward()
             self.scaler.unscale_(self.optimizer_g)

@@ -71,14 +71,14 @@ class PatchGANDiscriminator(nn.Module):
                 # Last layer: stride=1 (no further downsampling)
                 conv_block = nn.Sequential(
                     spectral_norm(nn.Conv2d(in_channels_current, out_channels, kernel_size=4, stride=1, padding=1)),
-                    nn.InstanceNorm2d(out_channels, affine=True),
+                    nn.InstanceNorm2d(out_channels, affine=True, eps=1e-5),
                     nn.LeakyReLU(0.2, inplace=False),
                 )
             else:
                 # Middle layers: stride=2 (progressive downsampling)
                 conv_block = nn.Sequential(
                     spectral_norm(nn.Conv2d(in_channels_current, out_channels, kernel_size=4, stride=2, padding=1)),
-                    nn.InstanceNorm2d(out_channels, affine=True),
+                    nn.InstanceNorm2d(out_channels, affine=True, eps=1e-5),
                     nn.LeakyReLU(0.2, inplace=False),
                 )
             
