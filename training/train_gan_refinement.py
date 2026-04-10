@@ -706,14 +706,21 @@ class GANRefinementTrainer:
 
             # ===== SINGLE REFINED CONDITIONAL FOR ALL D FORWARDS =====
             L_expanded_g = L_channel_g.expand(batch_size, -1, -1, -1) if L_channel_g.dim() == 3 else L_channel_g
-            refined_conditional = torch.cat([L_expanded_g, refined_g.detach()], dim=1)  # FIX 1: Detach refined_g
+            
+            # FIX 2 (CRITICAL): RECOMPUTE FOR G STEP - Create fresh conditional WITH gradients for adversarial loss
+            # This is separate from the D step forward and MUST have gradients flowing back to generator
+            refined_conditional_with_grad = torch.cat([L_expanded_g, refined_g], dim=1)  # NO detach for adversarial loss
+            
+            # Keep a detached version for FM block (monitoring only)
+            refined_conditional_detached = torch.cat([L_expanded_g, refined_g.detach()], dim=1)  # Detached for FM
             
             # FIX 2: FORCE CLAMP before D
-            refined_conditional = torch.clamp(refined_conditional, -1.0, 1.0)
+            refined_conditional_with_grad = torch.clamp(refined_conditional_with_grad, -1.0, 1.0)
+            refined_conditional_detached = torch.clamp(refined_conditional_detached, -1.0, 1.0)
             
             # FIX 6: SAFE CONV INPUT CHECK - ensure no NaN/Inf before discriminator
-            if torch.isnan(refined_conditional).any() or torch.isinf(refined_conditional).any():
-                logger.warning(f"⚠️ Skipping batch (NaN/Inf in refined_conditional)")
+            if torch.isnan(refined_conditional_with_grad).any() or torch.isinf(refined_conditional_with_grad).any():
+                logger.warning(f"⚠️ Skipping batch (NaN/Inf in refined_conditional_with_grad)")
                 self.optimizer_g.zero_grad(set_to_none=True)
                 for p in self.discriminator.parameters():
                     p.requires_grad = True
@@ -735,8 +742,9 @@ class GANRefinementTrainer:
             # --------------------------------------------------------
             # 🔥 ONLY ONE D forward in entire G step
             # FIX 3: DISABLE AMP FOR DISCRIMINATOR (disable inside autocast context)
+            # FIX 1: Use NON-DETACHED conditional to allow gradients to flow back to generator
             with torch.cuda.amp.autocast(enabled=False):
-                disc_fake_logits, disc_fake_g_features = self.discriminator(refined_conditional)
+                disc_fake_logits, disc_fake_g_features = self.discriminator(refined_conditional_with_grad)
             
             # FIX 4: CLAMP DISCRIMINATOR OUTPUT before loss (prevents extreme logits)
             disc_fake_logits = [torch.clamp(logit, -10, 10) for logit in disc_fake_logits]
@@ -756,10 +764,10 @@ class GANRefinementTrainer:
             # This prevents ANY graph building from interfering with adversarial loss
             with torch.no_grad():
                 # Fake features (no gradients) - extract intermediate features
-                # 💥 CRITICAL: Detach refined_conditional to break graph leak
                 # FIX 3: DISABLE AMP FOR FM discriminator calls
+                # FIX 1: Use detached conditional for FM (monitoring only, no gradient impact)
                 with torch.cuda.amp.autocast(enabled=False):
-                    disc_fake_fm_logits, disc_fake_fm_features = self.discriminator(refined_conditional.detach())
+                    disc_fake_fm_logits, disc_fake_fm_features = self.discriminator(refined_conditional_detached)
                 # FIX 4: CLAMP for consistency (monitoring only, but prevent extreme values)
                 disc_fake_fm_logits = [torch.clamp(logit, -10, 10) for logit in disc_fake_fm_logits]
                 # Flatten multi-scale features for matching
@@ -875,6 +883,9 @@ class GANRefinementTrainer:
                 "loss_r1": step_losses.get("loss_r1", 0.0),
                 "loss_adv_g": 0.0,
             }
+        
+        # FIX 4: VERIFY LOSS HAS GRAD (CRITICAL) - Strong assertion before backward
+        assert loss_g.requires_grad == True, f"CRITICAL: loss_g does not require gradients! grad_fn={loss_g.grad_fn}"
         
         if self.scaler is not None:
             self.scaler.scale(loss_g).backward()
