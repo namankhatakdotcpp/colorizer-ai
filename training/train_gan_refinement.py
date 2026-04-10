@@ -693,7 +693,7 @@ class GANRefinementTrainer:
                     fake_features.extend(scale_features)
                 
                 # Real features (no gradients)
-                real_noisy_g = target_g + 0.05 * torch.randn_like(target_g)
+                real_noisy_g = target_g + 0.01 * torch.randn_like(target_g)  # FIXED: 0.05 → 0.01 for consistency
                 real_noisy_g = torch.clamp(real_noisy_g, -1.0, 1.0)
                 real_conditional_g = torch.cat([L_expanded_g, real_noisy_g], dim=1)
                 # 💥 CRITICAL: Detach real_conditional_g to break graph leak
@@ -1068,6 +1068,9 @@ def main():
 
     # Setup device
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
+    # 🚀 OPTIMIZATION: Enable cudnn auto-tuning for faster GPU training
+    torch.backends.cudnn.benchmark = True
 
     # Create dataset and dataloader (with augmentation enabled)
     dataset = ImageRefinementDataset(
