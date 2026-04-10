@@ -357,8 +357,8 @@ class GANRefinementTrainer:
     def __init__(
         self,
         device: torch.device = None,
-        learning_rate_g: float = 5e-5,  # REDUCED: 1e-4 → 5e-5 for stability
-        learning_rate_d: float = 1e-4,  # REDUCED: 2e-4 → 1e-4 for stability
+        learning_rate_g: float = 2e-5,  # REDUCED: 5e-5 → 2e-5 for more stable convergence
+        learning_rate_d: float = 1e-5,  # REDUCED: 1e-4 → 1e-5 for more stable convergence
         lambda_l1: float = 50.0,
         lambda_perceptual: float = 10.0,
         lambda_adversarial: float = 1.0,
@@ -635,6 +635,10 @@ class GANRefinementTrainer:
             # ===== FRESH GENERATOR FORWARD FOR G STEP =====
             # Critical: NEVER reuse refined tensor from D step
             refined_g = self.generator(colorized_g)
+            
+            # 🔥 FIX 1: CLAMP OUTPUT TO VALID RANGE (MANDATORY)
+            # Prevents output from drifting outside [-1, 1] range
+            refined_g = torch.clamp(refined_g, -1.0, 1.0)
 
             # L1 loss: preserve content
             loss_l1 = self.l1_loss(refined_g, target_g)
@@ -663,6 +667,25 @@ class GANRefinementTrainer:
             # ===== SINGLE REFINED CONDITIONAL FOR ALL D FORWARDS =====
             L_expanded_g = L_channel_g.expand(batch_size, -1, -1, -1) if L_channel_g.dim() == 3 else L_channel_g
             refined_conditional = torch.cat([L_expanded_g, refined_g], dim=1)
+            
+            # 🔥 FIX 2: SANITY CHECK - Skip if NaN/Inf in input
+            if torch.isnan(refined_conditional).any() or torch.isinf(refined_conditional).any():
+                logger.warning(f"⚠️ Skipping batch (NaN/Inf in refined_conditional)")
+                self.optimizer_g.zero_grad(set_to_none=True)
+                for p in self.discriminator.parameters():
+                    p.requires_grad = True
+                return {
+                    "loss_d": step_losses.get("loss_d", 0.0),
+                    "loss_g": 0.0,
+                    "loss_l1": 0.0,
+                    "loss_identity": 0.0,
+                    "loss_perceptual": 0.0,
+                    "loss_histogram": 0.0,
+                    "loss_fft": 0.0,
+                    "loss_fm": 0.0,
+                    "loss_r1": step_losses.get("loss_r1", 0.0),
+                    "loss_adv_g": 0.0,
+                }
             
             # --------------------------------------------------------
             # 1️⃣ ADVERSARIAL LOSS (STANDARD GAN MATH)
