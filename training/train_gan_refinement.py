@@ -354,8 +354,8 @@ class GANRefinementTrainer:
     def __init__(
         self,
         device: torch.device = None,
-        learning_rate_g: float = 1e-4,
-        learning_rate_d: float = 2e-4,
+        learning_rate_g: float = 5e-5,  # REDUCED: 1e-4 → 5e-5 for stability
+        learning_rate_d: float = 1e-4,  # REDUCED: 2e-4 → 1e-4 for stability
         lambda_l1: float = 50.0,
         lambda_perceptual: float = 10.0,
         lambda_adversarial: float = 1.0,
@@ -593,8 +593,9 @@ class GANRefinementTrainer:
                 self.scaler.unscale_(self.optimizer_d)
             else:
                 (loss_d_real + loss_d_fake).backward()
-                
-            torch.nn.utils.clip_grad_norm_(self.discriminator.parameters(), max_norm=0.5)
+            
+            # Gradient clipping for stability
+            torch.nn.utils.clip_grad_norm_(self.discriminator.parameters(), max_norm=1.0)
             
             # 🔥 CRITICAL: After optimizer step, explicitly zero gradients
             # This prevents old gradients from interfering with G step
@@ -608,8 +609,10 @@ class GANRefinementTrainer:
             # Ensures D parameters are completely clean before G step
             self.optimizer_d.zero_grad(set_to_none=True)
 
-            # Store D step losses (will be overwritten for each d_iter)
+            # Store D step losses (will be overwritten for each d_iter, final value kept)
             step_losses["loss_d"] = loss_d.item()
+            step_losses["loss_d_real"] = loss_d_real.item()
+            step_losses["loss_d_fake"] = loss_d_fake.item()
             step_losses["loss_r1"] = loss_r1.item() if isinstance(loss_r1, torch.Tensor) else 0.0
 
         # ============== Generator Step ==============
@@ -641,13 +644,18 @@ class GANRefinementTrainer:
             if self.use_perceptual and self.perceptual_loss is not None:
                 loss_perceptual = self.perceptual_loss(refined_g, target_g.detach())
 
-            # Color histogram loss: match RGB distribution 
-            loss_histogram = color_histogram_loss(refined_g, target_g)
+            # Color histogram loss: match RGB distribution (NO GRAD - histogram doesn't support autograd)
+            # WRAPPED IN NO_GRAD: histogram operations detach tensors, so we compute separately
+            with torch.no_grad():
+                loss_histogram = color_histogram_loss(refined_g, target_g)
+            # ⚠️ NOTE: loss_histogram is NOT part of backprop - it's monitoring only
 
-            # FFT Loss: Frequency domain matching
-            fft_fake = torch.fft.rfft2(refined_g.float())
-            fft_real = torch.fft.rfft2(target_g.float())
-            loss_fft = torch.mean(torch.abs(fft_fake - fft_real).real)
+            # FFT Loss: Frequency domain matching (monitoring loss, no gradient flow)  
+            # WRAPPED IN NO_GRAD: FFT-based loss can have gradient flow issues
+            with torch.no_grad():
+                fft_fake = torch.fft.rfft2(refined_g.float())
+                fft_real = torch.fft.rfft2(target_g.float())
+                loss_fft = torch.mean(torch.abs(fft_fake - fft_real).real)
 
             # ===== SINGLE REFINED CONDITIONAL FOR ALL D FORWARDS =====
             L_expanded_g = L_channel_g.expand(batch_size, -1, -1, -1) if L_channel_g.dim() == 3 else L_channel_g
@@ -697,16 +705,26 @@ class GANRefinementTrainer:
                     loss_fm = fm_loss_total / max(len(real_features), 1)
             
             # ===== COMBINE ALL LOSSES WITH PRODUCTION WEIGHTS =====
-            # Loss combination: adversarial (for fooling D), + reconstruction (content fidelity)
-            # + perceptual (feature space), + feature matching (discriminator features),
-            # + histogram (color distribution), + FFT (frequency domain)
+            # 🔥 CRITICAL: ONLY include losses with active gradients
+            # - loss_adv_g: HAS gradients (backprop from disc_fake_logits)
+            # - loss_l1: HAS gradients (refined_g vs target_g)
+            # - loss_perceptual: HAS gradients (VGG features from refined_g)
+            # - loss_identity: HAS gradients (refined_g vs colorized_g)
+            # - loss_fm: NO gradients (computed in torch.no_grad())
+            # - loss_histogram: NO gradients (wrapped in torch.no_grad())
+            # - loss_fft: NO gradients (wrapped in torch.no_grad())
+            
+            # Build loss with ONLY gradient-active components
             loss_g = (
-                self.lambda_adversarial * loss_adv_g +        # GAN: 1.0
-                self.lambda_l1 * loss_l1 +                    # L1: 50.0 (content)
-                self.lambda_perceptual * loss_perceptual +    # Perceptual: 10.0
-                self.lambda_feature_matching * loss_fm +      # Feature Matching: 10.0
-                self.lambda_histogram * loss_histogram        # Histogram: 5.0
+                self.lambda_adversarial * loss_adv_g +        # GAN loss: 1.0 (fool discriminator)
+                self.lambda_l1 * loss_l1 +                    # L1 loss: 50.0 (content preservation)
+                self.lambda_l1 * 5.0 * loss_identity +        # Identity loss: 250.0 (color stability)
+                self.lambda_perceptual * loss_perceptual      # Perceptual loss: 10.0 (VGG features)
+                # REMOVED: loss_fm and loss_histogram - no gradients, use for monitoring only
             )
+            
+            # SAFETY: Verify loss requires grad before backward
+            assert loss_g.requires_grad == True, f"ERROR: loss_g requires_grad={loss_g.requires_grad}, must be True!"
 
         # 🔥 SAFETY ASSERTIONS: Verify complete graph isolation (no debug output)
         assert refined_g.requires_grad == True, "ERROR: refined_g MUST have gradients for G step!"
@@ -714,29 +732,41 @@ class GANRefinementTrainer:
         assert colorized_g.requires_grad == False, "ERROR: colorized_g MUST NOT have gradients!"
         assert not any(p.requires_grad for p in self.discriminator.parameters()), "ERROR: D parameters MUST be frozen during G step!"
 
+        # 🔥 VERIFY LOSS REQUIRES GRADIENTS BEFORE BACKWARD
+        print(f"DEBUG: loss_g.requires_grad={loss_g.requires_grad}, loss_g.grad_fn={loss_g.grad_fn}")
+        if not loss_g.requires_grad:
+            logger.error(f"CRITICAL: loss_g does not require gradients! grad_fn={loss_g.grad_fn}")
+            raise RuntimeError("loss_g must require gradients before backward pass")
+
         # 🔥 NaN DETECTION - Skip if loss is invalid
         if not torch.isfinite(loss_g):
             logger.warning(f"NaN/Inf in G loss, skipping batch")
             self.optimizer_g.zero_grad(set_to_none=True)
         else:
-            # 🔥 BACKWARD FOR G STEP
-            # This is the ONLY backward on loss_g for this train step
-            if self.scaler is not None:
-                self.scaler.scale(loss_g).backward()
-                self.scaler.unscale_(self.optimizer_g)
-            else:
-                loss_g.backward()
-            
-            torch.nn.utils.clip_grad_norm_(self.generator.parameters(), max_norm=0.5)
-            
-            if self.scaler is not None:
-                self.scaler.step(self.optimizer_g)
-                self.scaler.update()
-            else:
-                self.optimizer_g.step()
-            
-            # 🔥 EXPLICIT: Clear G gradients after step
-            self.optimizer_g.zero_grad(set_to_none=True)
+            try:
+                # 🔥 BACKWARD FOR G STEP
+                # This is the ONLY backward on loss_g for this train step
+                if self.scaler is not None:
+                    self.scaler.scale(loss_g).backward()
+                    self.scaler.unscale_(self.optimizer_g)
+                else:
+                    loss_g.backward()
+                
+                # Gradient clipping for stability
+                torch.nn.utils.clip_grad_norm_(self.generator.parameters(), max_norm=1.0)
+                
+                if self.scaler is not None:
+                    self.scaler.step(self.optimizer_g)
+                    self.scaler.update()
+                else:
+                    self.optimizer_g.step()
+                
+                # 🔥 EXPLICIT: Clear G gradients after step
+                self.optimizer_g.zero_grad(set_to_none=True)
+            except RuntimeError as e:
+                logger.error(f"Backward pass failed: {str(e)}")
+                self.optimizer_g.zero_grad(set_to_none=True)
+                raise
         
         # 🔥 CRITICAL: Restore discriminator gradients AFTER G step is complete
         for p in self.discriminator.parameters():
@@ -747,11 +777,19 @@ class GANRefinementTrainer:
             for param, ema_param in zip(self.generator.parameters(), self.generator_ema.parameters()):
                 ema_param.data = self.ema_decay * ema_param.data + (1 - self.ema_decay) * param.data
 
-        # Return single batch losses (not averaged lists)
+        # Return single batch losses with ALL components for monitoring
+        # Includes monitoring losses (histogram, fft, fm) that don't participate in backprop
         return {
-            "loss_d": step_losses.get("loss_d", loss_d.item()),
+            "loss_d": step_losses.get("loss_d", 0.0),
             "loss_g": loss_g.item(),
-            "loss_r1": step_losses.get("loss_r1", 0.0)
+            "loss_l1": loss_l1.item(),
+            "loss_identity": loss_identity.item(),
+            "loss_perceptual": loss_perceptual.item() if loss_perceptual > 0 else 0.0,
+            "loss_histogram": loss_histogram.item(),  # Monitoring only
+            "loss_fft": loss_fft.item(),              # Monitoring only
+            "loss_fm": loss_fm.item(),                # Monitoring only
+            "loss_r1": step_losses.get("loss_r1", 0.0),
+            "loss_adv_g": loss_adv_g.item(),
         }
 
     def train_epoch(self, data_loader: DataLoader) -> Tuple[Dict[str, float], Optional[torch.Tensor]]:
@@ -772,12 +810,14 @@ class GANRefinementTrainer:
             "loss_g": [],
             "loss_d": [],
             "loss_l1": [],
+            "loss_identity": [],
             "loss_perceptual": [],
             "loss_adversarial": [],
-            "loss_feature_matching": [],
-            "loss_identity": [],
+            "loss_histogram": [],      # Monitoring loss
+            "loss_fft": [],            # Monitoring loss
+            "loss_feature_matching": [],  # Monitoring loss
             "loss_r1": [],
-            "loss_fft": [],
+            "loss_adv_g": [],
         }
 
         sample_images = None
