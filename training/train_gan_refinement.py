@@ -1174,6 +1174,10 @@ class GANRefinementTrainer:
             "optimizer_d_state_dict": self.optimizer_d.state_dict(),
             "training_history": self.training_history,
         }
+        
+        # Save scaler state if available (for AMP resume)
+        if self.scaler is not None:
+            checkpoint["scaler_state_dict"] = self.scaler.state_dict()
 
         torch.save(
             checkpoint,
@@ -1189,7 +1193,7 @@ class GANRefinementTrainer:
             checkpoint_path: Path to checkpoint file
 
         Returns:
-            Epoch number from checkpoint
+            Next epoch number to start from
         """
         checkpoint = torch.load(checkpoint_path, map_location=self.device, weights_only=False)
 
@@ -1200,11 +1204,18 @@ class GANRefinementTrainer:
         self.optimizer_g.load_state_dict(checkpoint["optimizer_g_state_dict"])
         self.optimizer_d.load_state_dict(checkpoint["optimizer_d_state_dict"])
         self.training_history = checkpoint.get("training_history", {})
+        
+        # Load scaler state if available (for AMP resume)
+        if self.scaler is not None and "scaler_state_dict" in checkpoint:
+            self.scaler.load_state_dict(checkpoint["scaler_state_dict"])
+            logger.info("✅ GradScaler state restored (AMP)")
 
-        epoch = checkpoint["epoch"]
-        logger.info(f"Checkpoint loaded from epoch {epoch}")
+        saved_epoch = checkpoint["epoch"]
+        next_epoch = saved_epoch + 1
+        logger.info(f"🔄 Checkpoint loaded: epoch {saved_epoch + 1} completed")
+        logger.info(f"🔄 Resuming training from epoch {next_epoch + 1}...")
 
-        return epoch
+        return next_epoch
 
 
 def main():
