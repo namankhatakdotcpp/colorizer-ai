@@ -616,39 +616,59 @@ class GANRefinementTrainer:
             # Compute D loss WITHOUT R1 first
             loss_d = loss_d_real + loss_d_fake
             
-            # R1 penalty: separate backward, only every 4 steps
-            # 🔥 CRITICAL: R1 uses completely separate forward/backward to avoid double-backward error
+            # ===== R1 GRADIENT PENALTY (STEP 1-6: CORRECT IMPLEMENTATION) =====
+            # STEP 1: R1 requires real images with requires_grad=True (CRITICAL)
+            # STEP 2: Compute R1 gradients separately (independent graph)
+            # STEP 3: Scale R1 loss and ADD to total D loss
+            # STEP 4: Do ONE backward on total_d_loss (not separate backward)
             if self.d_steps % 4 == 0:
-                # Separate forward pass just for R1
-                real_for_r1 = real_noisy.detach().clone().requires_grad_(True)
+                # Real images MUST have requires_grad=True for R1
+                # STEP 1: ENABLE GRAD ON REAL IMAGES
+                real_for_r1 = real_noisy.detach().clone()
+                real_for_r1.requires_grad_(True)  # 💥 CRITICAL - this must be set BEFORE discriminator forward
+                
                 L_for_r1 = L_expanded.detach().clone()
                 real_cond_r1 = torch.cat([L_for_r1, real_for_r1], dim=1)
                 
-                # FIX 3: DISABLE AMP FOR R1 as well
+                # STEP 2: COMPUTE R1 CORRECTLY with torch.autograd.grad
                 with torch.amp.autocast(device_type='cuda', enabled=False):
                     disc_real_r1_logits, _ = self.discriminator(real_cond_r1)
                 
-                # R1 backward separately
-                r1_grad = torch.autograd.grad(
-                    outputs=disc_real_r1_logits[0].sum(),
-                    inputs=real_for_r1,
-                    create_graph=False,
-                    retain_graph=False,
-                    only_inputs=True,
-                )[0]
-                loss_r1 = r1_grad.pow(2).reshape(r1_grad.shape[0], -1).sum(1).mean()
+                # Compute gradient of discriminator output w.r.t. real images
+                # STEP 2: Verify real_for_r1 requires grad before grad computation
+                assert real_for_r1.requires_grad == True, "ERROR: real_for_r1 must require grad for R1 penalty!"
                 
-                # Add scaled R1 to D loss as a constant (detached)
-                loss_d = loss_d + 1.0 * loss_r1.detach()
-                
-                # Backward R1 separately
-                r1_backward = 1.0 * loss_r1
-                if self.scaler is not None:
-                    self.scaler.scale(r1_backward).backward()
-                else:
-                    r1_backward.backward()
+                try:
+                    r1_grads = torch.autograd.grad(
+                        outputs=disc_real_r1_logits[0].sum(),
+                        inputs=real_for_r1,
+                        create_graph=True,  # 💥 CRITICAL: create_graph=True so gradients can flow to D params
+                        retain_graph=True,
+                        only_inputs=True,
+                    )[0]
+                    
+                    # STEP 3: Compute R1 penalty
+                    r1_penalty = r1_grads.pow(2).reshape(r1_grads.shape[0], -1).sum(1).mean()
+                    loss_r1 = (10.0 / 2) * r1_penalty  # gamma=10 (standard for image-to-image tasks)
+                    
+                    # STEP 3: Verify R1 loss requires grad
+                    assert loss_r1.requires_grad == True, "ERROR: loss_r1 must require grad!"
+                    
+                except RuntimeError as e:
+                    logger.error(f"🔴 R1 gradient computation failed: {e}")
+                    logger.error(f"real_for_r1.requires_grad={real_for_r1.requires_grad}")
+                    logger.error(f"disc_real_r1_logits[0].requires_grad={disc_real_r1_logits[0].requires_grad}")
+                    loss_r1 = torch.tensor(0.0, device=device)
             else:
                 loss_r1 = torch.tensor(0.0, device=device)
+            
+            # STEP 4: COMBINE ALL LOSSES - Add R1 to total D loss
+            # 🔥 CRITICAL: ONE backward on total loss (not separate backward)
+            total_d_loss = loss_d + loss_r1  # loss_d already has requires_grad, and loss_r1 has graph
+            
+            # STEP 6: DEBUG CHECK - Verify both components have grad
+            assert loss_d.requires_grad == True, "ERROR: loss_d must require grad!"
+            assert loss_r1.requires_grad == True or (self.d_steps % 4 != 0), "ERROR: loss_r1 must require grad when computed!"
 
             # 🔥 SAFETY ASSERTION: Verify refined_d has NO gradients
             assert refined_d.requires_grad == False, "ERROR: refined_d MUST NOT have gradients!"
@@ -674,15 +694,16 @@ class GANRefinementTrainer:
                 continue
 
             # 🔥 BACKWARD FOR MAIN D LOSS (graph is now clean, separate from R1)
-            # STEP 5: ADD DEBUG OUTPUT BEFORE BACKWARD
+            # STEP 5: BACKWARD ON TOTAL LOSS (includes R1 if computed)
+            # Debug output before backward
             logger.debug(f"D Step {self.d_steps}: loss_d_real.requires_grad={loss_d_real.requires_grad}, loss_d_fake.requires_grad={loss_d_fake.requires_grad}")
-            logger.debug(f"D Step {self.d_steps}: loss_d_real={loss_d_real.item():.6f}, loss_d_fake={loss_d_fake.item():.6f}")
+            logger.debug(f"D Step {self.d_steps}: total_d_loss.requires_grad={total_d_loss.requires_grad}, total_d_loss={total_d_loss.item():.6f}")
             
             if self.scaler is not None:
-                self.scaler.scale(loss_d_real + loss_d_fake).backward()
+                self.scaler.scale(total_d_loss).backward()
                 self.scaler.unscale_(self.optimizer_d)
             else:
-                (loss_d_real + loss_d_fake).backward()
+                total_d_loss.backward()
             
             # Gradient clipping for stability
             # FIX 6: ADD GRADIENT CLIP (STRONGER) - 1.0 → 0.5 for tighter stability
@@ -701,10 +722,10 @@ class GANRefinementTrainer:
             self.optimizer_d.zero_grad(set_to_none=True)
 
             # Store D step losses (will be overwritten for each d_iter, final value kept)
-            step_losses["loss_d"] = loss_d.item()
+            step_losses["loss_d"] = total_d_loss.item()  # Total D loss (real + fake + R1)
             step_losses["loss_d_real"] = loss_d_real.item()
             step_losses["loss_d_fake"] = loss_d_fake.item()
-            step_losses["loss_r1"] = loss_r1.item() if isinstance(loss_r1, torch.Tensor) else 0.0
+            step_losses["loss_r1"] = loss_r1.item() if isinstance(loss_r1, torch.Tensor) and loss_r1.requires_grad else 0.0
 
         # ============== Generator Step ==============
         # 🔥 CRITICAL: Freeze discriminator to prevent graph overlap during G step
