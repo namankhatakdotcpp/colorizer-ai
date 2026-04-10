@@ -434,6 +434,10 @@ class GANRefinementTrainer:
         
         # Mixed Precision Training (AMP)
         self.scaler = torch.amp.GradScaler('cuda') if torch.cuda.is_available() else None
+        
+        # STEP 6: TEMPORARY DEBUG MODE - Disable AMP to run in full FP32 for testing
+        # Set to True to diagnose AMP-related crashes (runs slower but more stable)
+        self.debug_amp_disabled = False
 
         try:
             import torchvision
@@ -566,7 +570,8 @@ class GANRefinementTrainer:
                 logger.error("🔴 CRITICAL: Discriminator parameters do NOT require grad!")
                 raise RuntimeError("Discriminator parameters are frozen! Cannot compute gradients.")
             
-            with torch.cuda.amp.autocast(enabled=False):
+            # STEP 1: Use new torch.amp.autocast API (not deprecated torch.cuda.amp.autocast)
+            with torch.amp.autocast(device_type='cuda', enabled=False):
                 disc_real_logits, disc_real_features = self.discriminator(real_conditional)
                 disc_fake_logits, disc_fake_features = self.discriminator(fake_conditional)
 
@@ -620,7 +625,7 @@ class GANRefinementTrainer:
                 real_cond_r1 = torch.cat([L_for_r1, real_for_r1], dim=1)
                 
                 # FIX 3: DISABLE AMP FOR R1 as well
-                with torch.cuda.amp.autocast(enabled=False):
+                with torch.amp.autocast(device_type='cuda', enabled=False):
                     disc_real_r1_logits, _ = self.discriminator(real_cond_r1)
                 
                 # R1 backward separately
@@ -669,6 +674,10 @@ class GANRefinementTrainer:
                 continue
 
             # 🔥 BACKWARD FOR MAIN D LOSS (graph is now clean, separate from R1)
+            # STEP 5: ADD DEBUG OUTPUT BEFORE BACKWARD
+            logger.debug(f"D Step {self.d_steps}: loss_d_real.requires_grad={loss_d_real.requires_grad}, loss_d_fake.requires_grad={loss_d_fake.requires_grad}")
+            logger.debug(f"D Step {self.d_steps}: loss_d_real={loss_d_real.item():.6f}, loss_d_fake={loss_d_fake.item():.6f}")
+            
             if self.scaler is not None:
                 self.scaler.scale(loss_d_real + loss_d_fake).backward()
                 self.scaler.unscale_(self.optimizer_d)
@@ -710,7 +719,8 @@ class GANRefinementTrainer:
         L_channel_g = L_channel.detach().clone()
 
         # 🔥 CRITICAL: All G computations in one autocast block for consistency
-        with torch.amp.autocast('cuda', enabled=self.scaler is not None):
+        # STEP 6: Use debug_amp_disabled to run in full FP32 for testing stability
+        with torch.amp.autocast(device_type='cuda', enabled=self.scaler is not None and not self.debug_amp_disabled):
             # ===== FRESH GENERATOR FORWARD FOR G STEP =====
             # Critical: NEVER reuse refined tensor from D step
             refined_g = self.generator(colorized_g)
@@ -782,7 +792,7 @@ class GANRefinementTrainer:
             # 🔥 ONLY ONE D forward in entire G step
             # FIX 3: DISABLE AMP FOR DISCRIMINATOR (disable inside autocast context)
             # FIX 1: Use NON-DETACHED conditional to allow gradients to flow back to generator
-            with torch.cuda.amp.autocast(enabled=False):
+            with torch.amp.autocast(device_type='cuda', enabled=False):
                 disc_fake_logits, disc_fake_g_features = self.discriminator(refined_conditional_with_grad)
             
             # FIX 4: CLAMP DISCRIMINATOR OUTPUT before loss (prevents extreme logits)
@@ -805,7 +815,7 @@ class GANRefinementTrainer:
                 # Fake features (no gradients) - extract intermediate features
                 # FIX 3: DISABLE AMP FOR FM discriminator calls
                 # FIX 1: Use detached conditional for FM (monitoring only, no gradient impact)
-                with torch.cuda.amp.autocast(enabled=False):
+                with torch.amp.autocast(device_type='cuda', enabled=False):
                     disc_fake_fm_logits, disc_fake_fm_features = self.discriminator(refined_conditional_detached)
                 # FIX 4: CLAMP for consistency (monitoring only, but prevent extreme values)
                 disc_fake_fm_logits = [torch.clamp(logit, -10, 10) for logit in disc_fake_fm_logits]
@@ -820,7 +830,7 @@ class GANRefinementTrainer:
                 real_conditional_g = torch.cat([L_expanded_g, real_noisy_g], dim=1)
                 # 💥 CRITICAL: Detach real_conditional_g to break graph leak
                 # FIX 3: DISABLE AMP FOR FM discriminator calls
-                with torch.cuda.amp.autocast(enabled=False):
+                with torch.amp.autocast(device_type='cuda', enabled=False):
                     disc_real_fm_logits, disc_real_fm_features = self.discriminator(real_conditional_g.detach())
                 # FIX 4: CLAMP for consistency
                 disc_real_fm_logits = [torch.clamp(logit, -10, 10) for logit in disc_real_fm_logits]
@@ -905,6 +915,16 @@ class GANRefinementTrainer:
         # This is the ONLY backward on loss_g for this train step
         
         # FIX 5: GRADIENT NAN GUARD (CRITICAL) - Verify loss is safe before backward
+        logger.debug(f"G Loss Details: loss_g.requires_grad={loss_g.requires_grad}, loss_g={loss_g.item():.6f}")
+        logger.debug(f"G Loss Breakdown: adv={loss_adv_g.item():.6f}, l1={loss_l1.item():.6f}, identity={loss_identity.item():.6f}, perceptual={loss_perceptual.item():.6f}")
+        
+        # STEP 5: ADD DEBUG OUTPUT - Confirm loss requires grad before backward
+        if loss_g.requires_grad:
+            logger.debug("✅ G loss READY for backward (requires_grad=True)")
+        else:
+            logger.error(f"🔴 G loss CANNOT backward (requires_grad=False, grad_fn={loss_g.grad_fn})")
+            raise RuntimeError("Loss has no grad!")
+        
         if torch.isnan(loss_g) or torch.isinf(loss_g):
             logger.warning(f"⚠️ Skipping G backward due to NaN/Inf in loss_g")
             self.optimizer_g.zero_grad(set_to_none=True)
