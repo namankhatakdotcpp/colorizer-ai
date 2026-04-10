@@ -490,6 +490,13 @@ class GANRefinementTrainer:
         Returns:
             Dictionary with loss values
         """
+        # FIX 1: ENSURE D PARAMETERS ARE TRAINABLE AT START
+        # If a previous step crashed before restoring D params, this fixes it
+        for p in self.discriminator.parameters():
+            if not p.requires_grad:
+                logger.warning("⚠️ Discriminator parameters were frozen! Restoring trainability...")
+                p.requires_grad = True
+        
         colorized = batch["colorized"].to(self.device)
         target = batch["target"].to(self.device)
         L_channel = batch["L_channel"].to(self.device)      # NEW: LAB conditioning
@@ -550,15 +557,40 @@ class GANRefinementTrainer:
                 continue
 
             # Discriminator outputs (multi-scale with intermediate features)
+            # FIX 2: VERIFY REQUIRES_GRAD BEFORE FORWARD
             # FIX 3: DISABLE AMP FOR DISCRIMINATOR to prevent NaN in convolution
+            
+            # Diagnostic: Check that discriminator parameters require grad
+            d_params_require_grad = any(p.requires_grad for p in self.discriminator.parameters())
+            if not d_params_require_grad:
+                logger.error("🔴 CRITICAL: Discriminator parameters do NOT require grad!")
+                raise RuntimeError("Discriminator parameters are frozen! Cannot compute gradients.")
+            
             with torch.cuda.amp.autocast(enabled=False):
                 disc_real_logits, disc_real_features = self.discriminator(real_conditional)
                 disc_fake_logits, disc_fake_features = self.discriminator(fake_conditional)
+
+            # FIX 1: VERIFY DISCRIMINATOR PARAMETERS REQUIRE GRAD
+            # If this fails, D parameters are frozen (likely from previous step error)
+            assert any(p.requires_grad for p in self.discriminator.parameters()), \
+                "CRITICAL: Discriminator parameters do NOT require grad! Parameters are frozen."
+            
+            # FIX 3: VERIFY DISCRIMINATOR OUTPUTS REQUIRE GRAD
+            # If this fails, gradient flow is broken in discriminator
+            assert disc_real_logits[0].requires_grad, \
+                f"ERROR: disc_real_logits[0] requires_grad={disc_real_logits[0].requires_grad}, must be True!"
+            assert disc_fake_logits[0].requires_grad, \
+                f"ERROR: disc_fake_logits[0] requires_grad={disc_fake_logits[0].requires_grad}, must be True!"
 
             # FIX 4: CLAMP DISCRIMINATOR OUTPUT before loss (prevents extreme logits)
             # Clamp to [-10, 10] to prevent numerical explosion in BCE sigmoid
             disc_real_logits = [torch.clamp(logit, -10, 10) for logit in disc_real_logits]
             disc_fake_logits = [torch.clamp(logit, -10, 10) for logit in disc_fake_logits]
+            
+            # FIX 4: VERIFY CLAMPING PRESERVES REQUIRES_GRAD
+            # torch.clamp preserves requires_grad, but verify it
+            assert disc_real_logits[0].requires_grad, "ERROR: Clamping broke requires_grad for real logits!"
+            assert disc_fake_logits[0].requires_grad, "ERROR: Clamping broke requires_grad for fake logits!"
 
             # ===== DISCRIMINATOR LOSS WITH LABEL SMOOTHING =====
             # Label smoothing: real=0.9, fake=0.1 (prevents discriminator collapse)
@@ -568,6 +600,13 @@ class GANRefinementTrainer:
             # BCE loss with label smoothing for stability
             loss_d_real = self.adversarial_loss(disc_real_logits[0], real_labels)
             loss_d_fake = self.adversarial_loss(disc_fake_logits[0], fake_labels)
+            
+            # FIX 4: VERIFY LOSS REQUIRES GRAD (CRITICAL)
+            # This must be True for backward() to work
+            assert loss_d_real.requires_grad, \
+                f"ERROR: loss_d_real requires_grad={loss_d_real.requires_grad}, must be True!"
+            assert loss_d_fake.requires_grad, \
+                f"ERROR: loss_d_fake requires_grad={loss_d_fake.requires_grad}, must be True!"
             
             # Compute D loss WITHOUT R1 first
             loss_d = loss_d_real + loss_d_fake
