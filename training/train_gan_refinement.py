@@ -537,6 +537,13 @@ class GANRefinementTrainer:
             # Add noise to fake images (same as real for consistency)
             fake_noisy = refined_d + 0.01 * torch.randn_like(refined_d)  # REDUCED: 0.05 → 0.01
             fake_noisy = torch.clamp(fake_noisy, -1.0, 1.0)
+            
+            # 🔥 MIXUP TRAINING: Mix real and fake for discriminator
+            # This makes discriminator stronger by training on intermediate samples
+            # alpha = 0.2 creates 80% real + 20% fake blends
+            alpha = 0.2
+            mixed = alpha * fake_noisy + (1 - alpha) * real_noisy
+            mixed = torch.clamp(mixed, -1.0, 1.0)
 
             # UPGRADE: LAB Conditioning (SIMPLE & CLEAN: [L, RGB] = 4 channels)
             # L provides brightness context from target
@@ -546,6 +553,7 @@ class GANRefinementTrainer:
             # Concatenate [L (1ch) + RGB (3ch)] = 4 channels (discriminator input channels)
             real_conditional = torch.cat([L_expanded, real_noisy_for_grad], dim=1)  # 4 channels: 1 (L) + 3 (RGB)
             fake_conditional = torch.cat([L_expanded, fake_noisy], dim=1)  # 4 channels: 1 (L) + 3 (RGB)
+            mixed_conditional = torch.cat([L_expanded, mixed], dim=1)  # 4 channels: 1 (L) + 3 (RGB) - for mixup
 
             # FIX 2: FORCE INPUT CLAMP before D (safety)
             fake_conditional = torch.clamp(fake_conditional, -1.0, 1.0)
@@ -575,6 +583,20 @@ class GANRefinementTrainer:
             with torch.amp.autocast(device_type='cuda', enabled=False):
                 disc_real_logits, disc_real_features = self.discriminator(real_conditional)
                 disc_fake_logits, disc_fake_features = self.discriminator(fake_conditional)
+                disc_mixed_logits, _ = self.discriminator(mixed_conditional)  # 🔥 MIXUP: Train on mixed samples
+            
+            # 🔥 VERIFY PATCH DISCRIMINATOR OUTPUTS (shape check)
+            # Expected: list of [B, 1, H, W] tensors (patch maps)
+            # If output is [B, 1], discriminator is NOT patch-based (issue!)
+            if isinstance(disc_real_logits, (list, tuple)):
+                for scale_idx, logit in enumerate(disc_real_logits):
+                    if logit.dim() == 2:
+                        logger.warning(f"⚠️ Patch Discriminator Output Issue: Scale {scale_idx} has shape {logit.shape} (expected [B, 1, H, W])")
+                        # Reshape if it's [B, 1] to ensure proper patch discrimination
+                        if logit.shape[1] == 1 and logit.dim() == 2:
+                            disc_real_logits[scale_idx] = logit.unsqueeze(-1).unsqueeze(-1)
+                            disc_fake_logits[scale_idx] = disc_fake_logits[scale_idx].unsqueeze(-1).unsqueeze(-1)
+                            disc_mixed_logits[scale_idx] = disc_mixed_logits[scale_idx].unsqueeze(-1).unsqueeze(-1)
 
             # FIX 1: VERIFY DISCRIMINATOR PARAMETERS REQUIRE GRAD
             # If this fails, D parameters are frozen (likely from previous step error)
@@ -598,14 +620,16 @@ class GANRefinementTrainer:
             assert disc_real_logits[0].requires_grad, "ERROR: Clamping broke requires_grad for real logits!"
             assert disc_fake_logits[0].requires_grad, "ERROR: Clamping broke requires_grad for fake logits!"
 
-            # ===== DISCRIMINATOR LOSS WITH LABEL SMOOTHING =====
+            # ===== DISCRIMINATOR LOSS WITH LABEL SMOOTHING & MIXUP =====
             # Label smoothing: real=0.9, fake=0.1 (prevents discriminator collapse)
             real_labels = torch.full_like(disc_real_logits[0], self.real_label_smooth)
             fake_labels = torch.full_like(disc_fake_logits[0], self.fake_label)
+            mixed_labels = torch.full_like(disc_mixed_logits[0], self.real_label_smooth * 0.9 + self.fake_label * 0.1)  # 🔥 MIXUP: Mixed label = 0.765
             
             # BCE loss with label smoothing for stability
             loss_d_real = self.adversarial_loss(disc_real_logits[0], real_labels)
             loss_d_fake = self.adversarial_loss(disc_fake_logits[0], fake_labels)
+            loss_d_mixed = self.adversarial_loss(disc_mixed_logits[0], mixed_labels)  # 🔥 MIXUP: Add mixed loss (1/3 weight)
             
             # FIX 4: VERIFY LOSS REQUIRES GRAD (CRITICAL)
             # This must be True for backward() to work
@@ -615,7 +639,8 @@ class GANRefinementTrainer:
                 f"ERROR: loss_d_fake requires_grad={loss_d_fake.requires_grad}, must be True!"
             
             # Compute D loss WITHOUT R1 first
-            loss_d = loss_d_real + loss_d_fake
+            # 🔥 MIXUP: Add mixed loss with 1/3 weight to balance with real+fake
+            loss_d = loss_d_real + loss_d_fake + 0.33 * loss_d_mixed
             
             # ===== R1 GRADIENT PENALTY (STEP 1-6: CORRECT IMPLEMENTATION) =====
             # STEP 1: R1 requires real images with requires_grad=True (CRITICAL)
@@ -707,8 +732,21 @@ class GANRefinementTrainer:
                 total_d_loss.backward()
             
             # Gradient clipping for stability
-            # FIX 1: GRADIENT CLIP (MOST IMPORTANT) - prevents exploding gradients
+            # FIX 1: GRADIENT CLIP (MOST IMPORTANT) - prevents exploding gradients (loss scaling fix #1)
             torch.nn.utils.clip_grad_norm_(self.discriminator.parameters(), max_norm=1.0)
+            
+            # 🔥 ADDITIONAL: Verify no NaN gradients after clipping
+            d_has_nan_grads = False
+            for param in self.discriminator.parameters():
+                if param.grad is not None and not torch.isfinite(param.grad).all():
+                    d_has_nan_grads = True
+                    logger.warning(f"⚠️ NaN detected in D gradients after clipping, zeroing")
+                    param.grad.zero_()
+            
+            if d_has_nan_grads:
+                logger.warning(f"⚠️ D step {self.d_steps}: NaN gradients detected, skipping optimizer step")
+                self.optimizer_d.zero_grad(set_to_none=True)
+                continue
             
             # 🔥 CRITICAL: After optimizer step, explicitly zero gradients
             # This prevents old gradients from interfering with G step
@@ -772,6 +810,13 @@ class GANRefinementTrainer:
             # WRAPPED IN NO_GRAD: histogram operations detach tensors, so we compute separately
             with torch.no_grad():
                 loss_histogram = color_histogram_loss(refined_g, target_g)
+                
+                # 🔥 FIX: HISTOGRAM LOSS INSTABILITY - Handle NaN case (prevents gradient explosion)
+                # If histogram loss is NaN, replace with 0.0 to skip monitoring
+                if torch.isnan(loss_histogram) or torch.isinf(loss_histogram):
+                    logger.warning(f"⚠️ Histogram loss is NaN/Inf, replacing with 0.0 for safety")
+                    loss_histogram = torch.tensor(0.0, device=device)
+            
             # ⚠️ NOTE: loss_histogram is NOT part of backprop - it's monitoring only
 
             # FFT Loss: Frequency domain matching (monitoring loss, no gradient flow)  
@@ -780,6 +825,11 @@ class GANRefinementTrainer:
                 fft_fake = torch.fft.rfft2(refined_g.float())
                 fft_real = torch.fft.rfft2(target_g.float())
                 loss_fft = torch.mean(torch.abs(fft_fake - fft_real).real)
+                
+                # 🔥 FIX: FFT LOSS INSTABILITY - Handle NaN case
+                if torch.isnan(loss_fft) or torch.isinf(loss_fft):
+                    logger.warning(f"⚠️ FFT loss is NaN/Inf, replacing with 0.0 for safety")
+                    loss_fft = torch.tensor(0.0, device=device)
 
             # ===== SINGLE REFINED CONDITIONAL FOR ALL D FORWARDS =====
             L_expanded_g = L_channel_g.expand(batch_size, -1, -1, -1) if L_channel_g.dim() == 3 else L_channel_g
@@ -823,8 +873,10 @@ class GANRefinementTrainer:
             with torch.amp.autocast(device_type='cuda', enabled=False):
                 disc_fake_logits, disc_fake_g_features = self.discriminator(refined_conditional_with_grad)
             
-            # FIX 4: CLAMP DISCRIMINATOR OUTPUT before loss (prevents extreme logits)
+            # FIX 4: CLAMP DISCRIMINATOR OUTPUT before loss (prevents extreme logits - CRITICAL for loss scaling)
+            disc_real_logits = [torch.clamp(logit, -10, 10) for logit in disc_real_logits]
             disc_fake_logits = [torch.clamp(logit, -10, 10) for logit in disc_fake_logits]
+            disc_mixed_logits = [torch.clamp(logit, -10, 10) for logit in disc_mixed_logits]  # 🔥 MIXUP: Clamp mixed logits
             
             # 💯 Standard adversarial loss (BCE - same as discriminator)
             # Use first scale's logits for adversarial loss
@@ -980,9 +1032,36 @@ class GANRefinementTrainer:
         else:
             loss_g.backward()
         
-        # ✅ Gradient clipping for stability (prevents explosion)
-        # FIX 1: GRADIENT CLIP (MOST IMPORTANT) - prevents exploding gradients
-        torch.nn.utils.clip_grad_norm_(self.generator.parameters(), max_norm=1.0)
+# ✅ Gradient clipping for stability (prevents explosion - loss scaling fix #2)
+            # FIX 1: GRADIENT CLIP (MOST IMPORTANT) - prevents exploding gradients
+            torch.nn.utils.clip_grad_norm_(self.generator.parameters(), max_norm=1.0)
+            
+            # 🔥 ADDITIONAL: Verify no NaN gradients in G after clipping
+            g_has_nan_grads = False
+            for param in self.generator.parameters():
+                if param.grad is not None and not torch.isfinite(param.grad).all():
+                    g_has_nan_grads = True
+                    logger.warning(f"⚠️ NaN detected in G gradients after clipping, zeroing")
+                    param.grad.zero_()
+            
+            if g_has_nan_grads:
+                logger.warning(f"⚠️ G step: NaN gradients detected, skipping optimizer step but continuing training")
+                self.optimizer_g.zero_grad(set_to_none=True)
+                for p in self.discriminator.parameters():
+                    p.requires_grad = True
+                # Return previous losses instead of crashing
+                return step_losses if step_losses else {
+                    "loss_d": 0.0,
+                    "loss_g": 0.0,
+                    "loss_l1": 0.0,
+                    "loss_identity": 0.0,
+                    "loss_perceptual": 0.0,
+                    "loss_histogram": 0.0,
+                    "loss_fft": 0.0,
+                    "loss_fm": 0.0,
+                    "loss_r1": 0.0,
+                    "loss_adv_g": 0.0,
+                }
         
         # ✅ Step and clear optimizer
         if self.scaler is not None:
