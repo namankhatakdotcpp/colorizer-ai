@@ -998,15 +998,32 @@ class GANRefinementTrainer:
 
         # Return single batch losses with ALL components for monitoring
         # Includes monitoring losses (histogram, fft, fm) that don't participate in backprop
+        # Calculate totals for logging
+        loss_g_total = (
+            self.lambda_adversarial * loss_adv_g +
+            self.lambda_l1 * loss_l1 +
+            self.lambda_l1 * 5.0 * loss_identity +
+            self.lambda_perceptual * loss_perceptual
+        )
+        loss_d_total = step_losses.get("loss_d", 0.0)
+        
         return {
             "loss_d": step_losses.get("loss_d", 0.0),
+            "loss_d_total": loss_d_total,
+            "loss_d_real": step_losses.get("loss_d_real", 0.0),
+            "loss_d_fake": step_losses.get("loss_d_fake", 0.0),
             "loss_g": loss_g.item(),
-            "loss_l1": loss_l1.item(),
-            "loss_identity": loss_identity.item(),
-            "loss_perceptual": loss_perceptual.item() if loss_perceptual > 0 else 0.0,
-            "loss_histogram": loss_histogram.item(),  # Monitoring only
-            "loss_fft": loss_fft.item(),              # Monitoring only
-            "loss_fm": loss_fm.item(),                # Monitoring only
+            "loss_g_total": loss_g_total.item() if isinstance(loss_g_total, torch.Tensor) else loss_g_total,
+            "loss_g_adv": loss_adv_g.item(),
+            "loss_g_l1": loss_l1.item(),
+            "loss_g_identity": loss_identity.item(),
+            "loss_g_perceptual": loss_perceptual.item() if loss_perceptual > 0 else 0.0,
+            "loss_g_feature_matching": loss_fm.item(),
+            "loss_g_histogram": loss_histogram.item(),  # Monitoring only
+            "loss_g_fft": loss_fft.item(),              # Monitoring only
+            "loss_histogram": loss_histogram.item(),    # Legacy key for compatibility
+            "loss_fft": loss_fft.item(),                # Legacy key for compatibility
+            "loss_fm": loss_fm.item(),                  # Legacy key for compatibility
             "loss_r1": step_losses.get("loss_r1", 0.0),
             "loss_adv_g": loss_adv_g.item(),
         }
@@ -1027,18 +1044,28 @@ class GANRefinementTrainer:
 
         epoch_losses = {
             "loss_g": [],
+            "loss_g_total": [],
+            "loss_g_adv": [],
+            "loss_g_l1": [],
+            "loss_g_identity": [],
+            "loss_g_perceptual": [],
+            "loss_g_feature_matching": [],
+            "loss_g_histogram": [],
+            "loss_g_fft": [],
             "loss_d": [],
+            "loss_d_total": [],
+            "loss_d_real": [],
+            "loss_d_fake": [],
             "loss_l1": [],
             "loss_identity": [],
             "loss_perceptual": [],
             "loss_adversarial": [],
-            "loss_histogram": [],      # Monitoring loss
-            "loss_fft": [],            # Monitoring loss
-            "loss_fm": [],             # FIX 1: Match train_step key 'loss_fm' (was 'loss_feature_matching')
+            "loss_histogram": [],      # Monitoring loss (legacy key)
+            "loss_fft": [],            # Monitoring loss (legacy key)
+            "loss_fm": [],             # Monitoring loss (legacy key)
             "loss_r1": [],
             "loss_adv_g": [],
         }
-        # FIX 3: CONSISTENCY - Keys here MUST match those returned by train_step() method (lines 910-920)
 
         sample_images = None
 
@@ -1069,9 +1096,13 @@ class GANRefinementTrainer:
                 pbar.update(1)
 
         # Average losses
-        avg_losses = {
-            key: np.mean(values) for key, values in epoch_losses.items()
-        }
+        # FIX: Handle empty lists (prevent RuntimeWarning: Mean of empty slice)
+        avg_losses = {}
+        for key, values in epoch_losses.items():
+            if len(values) > 0:
+                avg_losses[key] = np.mean(values)
+            else:
+                avg_losses[key] = 0.0
 
         return avg_losses, sample_images
 
@@ -1107,9 +1138,12 @@ class GANRefinementTrainer:
                     loss_perceptual = self.perceptual_loss(refined, target)
                     val_losses["loss_perceptual"].append(loss_perceptual.item())
 
-        avg_val_losses = {
-            key: np.mean(values) for key, values in val_losses.items()
-        }
+        avg_val_losses = {}
+        for key, values in val_losses.items():
+            if len(values) > 0:
+                avg_val_losses[key] = np.mean(values)
+            else:
+                avg_val_losses[key] = 0.0
 
         return avg_val_losses
 
