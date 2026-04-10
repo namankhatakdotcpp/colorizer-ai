@@ -203,8 +203,16 @@ def color_histogram_loss(fake: torch.Tensor, real: torch.Tensor, num_bins: int =
     # Compute histogram loss for each RGB channel
     for c in range(3):
         # Compute histograms for each image in batch
-        fake_hist = torch.histogram(fake_norm[:, c, :, :].flatten(), bins=num_bins, range=(0.0, 1.0)).hist
-        real_hist = torch.histogram(real_norm[:, c, :, :].flatten(), bins=num_bins, range=(0.0, 1.0)).hist
+        fake_hist = torch.histogram(
+            fake_norm[:, c, :, :].flatten().detach().cpu(),
+            bins=num_bins,
+            range=(0.0, 1.0)
+        ).hist.to(fake.device)
+        real_hist = torch.histogram(
+            real_norm[:, c, :, :].flatten().detach().cpu(),
+            bins=num_bins,
+            range=(0.0, 1.0)
+        ).hist.to(fake.device)
         
         # Normalize histograms
         fake_hist = fake_hist / (fake_hist.sum() + 1e-8)
