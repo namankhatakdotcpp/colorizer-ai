@@ -34,6 +34,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# 🔥 ENABLE ANOMALY DETECTION FOR GRADIENT FLOW DEBUGGING
+torch.autograd.set_detect_anomaly(True)
+
 
 class VGGPerceptualLoss(nn.Module):
     """VGG-based perceptual loss for feature matching."""
@@ -508,15 +511,15 @@ class GANRefinementTrainer:
             with torch.no_grad():
                 refined_d = self.generator(colorized)  # NO gradient graph
             
-            # Add small noise to real images for stability
-            real_noisy = target + 0.05 * torch.randn_like(target)
+            # Add small noise to real images for stability (label smoothing + noise)
+            real_noisy = target + 0.01 * torch.randn_like(target)  # REDUCED: 0.05 → 0.01 for stability
             real_noisy = torch.clamp(real_noisy, -1.0, 1.0)
             
             # Real images need gradients for R1 penalty
             real_noisy_for_grad = real_noisy.detach().clone().requires_grad_(True)
             
-            # Add noise to fake images
-            fake_noisy = refined_d + 0.05 * torch.randn_like(refined_d)
+            # Add noise to fake images (same as real for consistency)
+            fake_noisy = refined_d + 0.01 * torch.randn_like(refined_d)  # REDUCED: 0.05 → 0.01
             fake_noisy = torch.clamp(fake_noisy, -1.0, 1.0)
 
             # UPGRADE: LAB Conditioning (SIMPLE & CLEAN: [L, RGB] = 4 channels)
@@ -732,41 +735,64 @@ class GANRefinementTrainer:
         assert colorized_g.requires_grad == False, "ERROR: colorized_g MUST NOT have gradients!"
         assert not any(p.requires_grad for p in self.discriminator.parameters()), "ERROR: D parameters MUST be frozen during G step!"
 
-        # 🔥 VERIFY LOSS REQUIRES GRADIENTS BEFORE BACKWARD
-        print(f"DEBUG: loss_g.requires_grad={loss_g.requires_grad}, loss_g.grad_fn={loss_g.grad_fn}")
+        # 🔥 VERIFY LOSS REQUIRES GRADIENTS BEFORE BACKWARD (SAFETY CHECK)
         if not loss_g.requires_grad:
             logger.error(f"CRITICAL: loss_g does not require gradients! grad_fn={loss_g.grad_fn}")
-            raise RuntimeError("loss_g must require gradients before backward pass")
-
-        # 🔥 NaN DETECTION - Skip if loss is invalid
-        if not torch.isfinite(loss_g):
-            logger.warning(f"NaN/Inf in G loss, skipping batch")
+            # Return without updating - skip this bad batch
             self.optimizer_g.zero_grad(set_to_none=True)
+            for p in self.discriminator.parameters():
+                p.requires_grad = True
+            return {
+                "loss_d": step_losses.get("loss_d", 0.0),
+                "loss_g": 0.0,
+                "loss_l1": 0.0,
+                "loss_identity": 0.0,
+                "loss_perceptual": 0.0,
+                "loss_histogram": 0.0,
+                "loss_fft": 0.0,
+                "loss_fm": 0.0,
+                "loss_r1": step_losses.get("loss_r1", 0.0),
+                "loss_adv_g": 0.0,
+            }
+
+        # 🔥 NaN DETECTION - Skip if loss is invalid (SAFETY CHECK)
+        if not torch.isfinite(loss_g):
+            logger.warning(f"⚠️ NaN/Inf in G loss (loss={loss_g.item()}), skipping batch")
+            self.optimizer_g.zero_grad(set_to_none=True)
+            for p in self.discriminator.parameters():
+                p.requires_grad = True
+            return {
+                "loss_d": step_losses.get("loss_d", 0.0),
+                "loss_g": 0.0,
+                "loss_l1": 0.0,
+                "loss_identity": 0.0,
+                "loss_perceptual": 0.0,
+                "loss_histogram": 0.0,
+                "loss_fft": 0.0,
+                "loss_fm": 0.0,
+                "loss_r1": step_losses.get("loss_r1", 0.0),
+                "loss_adv_g": 0.0,
+            }
+        # 🔥 BACKWARD FOR G STEP (ONLY REACHED if loss is valid)
+        # This is the ONLY backward on loss_g for this train step
+        if self.scaler is not None:
+            self.scaler.scale(loss_g).backward()
+            self.scaler.unscale_(self.optimizer_g)
         else:
-            try:
-                # 🔥 BACKWARD FOR G STEP
-                # This is the ONLY backward on loss_g for this train step
-                if self.scaler is not None:
-                    self.scaler.scale(loss_g).backward()
-                    self.scaler.unscale_(self.optimizer_g)
-                else:
-                    loss_g.backward()
-                
-                # Gradient clipping for stability
-                torch.nn.utils.clip_grad_norm_(self.generator.parameters(), max_norm=1.0)
-                
-                if self.scaler is not None:
-                    self.scaler.step(self.optimizer_g)
-                    self.scaler.update()
-                else:
-                    self.optimizer_g.step()
-                
-                # 🔥 EXPLICIT: Clear G gradients after step
-                self.optimizer_g.zero_grad(set_to_none=True)
-            except RuntimeError as e:
-                logger.error(f"Backward pass failed: {str(e)}")
-                self.optimizer_g.zero_grad(set_to_none=True)
-                raise
+            loss_g.backward()
+        
+        # ✅ Gradient clipping for stability (prevents explosion)
+        torch.nn.utils.clip_grad_norm_(self.generator.parameters(), max_norm=1.0)
+        
+        # ✅ Step and clear optimizer
+        if self.scaler is not None:
+            self.scaler.step(self.optimizer_g)
+            self.scaler.update()
+        else:
+            self.optimizer_g.step()
+        
+        # ✅ EXPLICIT: Clear G gradients after step
+        self.optimizer_g.zero_grad(set_to_none=True)
         
         # 🔥 CRITICAL: Restore discriminator gradients AFTER G step is complete
         for p in self.discriminator.parameters():
