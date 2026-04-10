@@ -670,9 +670,11 @@ class GANRefinementTrainer:
             # 🔥 ONLY ONE D forward in entire G step
             disc_fake_logits, disc_fake_g_features = self.discriminator(refined_conditional)
             
-            # 💯 Standard adversarial loss (no hacks, just correct math)
+            # 💯 Standard adversarial loss (BCE - same as discriminator)
             # Use first scale's logits for adversarial loss
-            loss_adv_g = -disc_fake_logits[0].mean()
+            # Generator tries to fool D by making fake images look "real" (label=0.9)
+            real_labels = torch.full_like(disc_fake_logits[0], 0.9)  # Label smoothing: 0.9 instead of 1.0
+            loss_adv_g = self.adversarial_loss(disc_fake_logits[0], real_labels)
 
             # --------------------------------------------------------
             # 2️⃣ FEATURE MATCHING (NO GRAPH - COMPLETELY ISOLATED)
