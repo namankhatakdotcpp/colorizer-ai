@@ -357,8 +357,8 @@ class GANRefinementTrainer:
     def __init__(
         self,
         device: torch.device = None,
-        learning_rate_g: float = 2e-5,  # REDUCED: 5e-5 → 2e-5 for more stable convergence
-        learning_rate_d: float = 1e-5,  # REDUCED: 1e-4 → 1e-5 for more stable convergence
+        learning_rate_g: float = 5e-5,  # FIX 2: TTUR balanced - reduced further for stability
+        learning_rate_d: float = 2e-5,  # FIX 2: TTUR balanced (safer: 2e-5 instead of same as G)
         lambda_l1: float = 50.0,
         lambda_perceptual: float = 10.0,
         lambda_adversarial: float = 1.0,
@@ -424,7 +424,8 @@ class GANRefinementTrainer:
         logger.info(f"Generator EMA initialized (decay: {self.ema_decay})")
 
         # Loss functions
-        self.adversarial_loss = nn.BCEWithLogitsLoss()
+        # FIX 7: ADD LOGIT STABILITY - pos_weight prevents numerical collapse
+        self.adversarial_loss = nn.BCEWithLogitsLoss(pos_weight=torch.tensor([1.0]).to(self.device))
         self.l1_loss = nn.L1Loss()
         
         # Label smoothing for stability (standard GAN tech)
@@ -554,6 +555,11 @@ class GANRefinementTrainer:
                 disc_real_logits, disc_real_features = self.discriminator(real_conditional)
                 disc_fake_logits, disc_fake_features = self.discriminator(fake_conditional)
 
+            # FIX 4: CLAMP DISCRIMINATOR OUTPUT before loss (prevents extreme logits)
+            # Clamp to [-10, 10] to prevent numerical explosion in BCE sigmoid
+            disc_real_logits = [torch.clamp(logit, -10, 10) for logit in disc_real_logits]
+            disc_fake_logits = [torch.clamp(logit, -10, 10) for logit in disc_fake_logits]
+
             # ===== DISCRIMINATOR LOSS WITH LABEL SMOOTHING =====
             # Label smoothing: real=0.9, fake=0.1 (prevents discriminator collapse)
             real_labels = torch.full_like(disc_real_logits[0], self.real_label_smooth)
@@ -631,7 +637,8 @@ class GANRefinementTrainer:
                 (loss_d_real + loss_d_fake).backward()
             
             # Gradient clipping for stability
-            torch.nn.utils.clip_grad_norm_(self.discriminator.parameters(), max_norm=1.0)
+            # FIX 6: ADD GRADIENT CLIP (STRONGER) - 1.0 → 0.5 for tighter stability
+            torch.nn.utils.clip_grad_norm_(self.discriminator.parameters(), max_norm=0.5)
             
             # 🔥 CRITICAL: After optimizer step, explicitly zero gradients
             # This prevents old gradients from interfering with G step
@@ -731,6 +738,9 @@ class GANRefinementTrainer:
             with torch.cuda.amp.autocast(enabled=False):
                 disc_fake_logits, disc_fake_g_features = self.discriminator(refined_conditional)
             
+            # FIX 4: CLAMP DISCRIMINATOR OUTPUT before loss (prevents extreme logits)
+            disc_fake_logits = [torch.clamp(logit, -10, 10) for logit in disc_fake_logits]
+            
             # 💯 Standard adversarial loss (BCE - same as discriminator)
             # Use first scale's logits for adversarial loss
             # Generator tries to fool D by making fake images look "real" (label=0.9)
@@ -750,6 +760,8 @@ class GANRefinementTrainer:
                 # FIX 3: DISABLE AMP FOR FM discriminator calls
                 with torch.cuda.amp.autocast(enabled=False):
                     disc_fake_fm_logits, disc_fake_fm_features = self.discriminator(refined_conditional.detach())
+                # FIX 4: CLAMP for consistency (monitoring only, but prevent extreme values)
+                disc_fake_fm_logits = [torch.clamp(logit, -10, 10) for logit in disc_fake_fm_logits]
                 # Flatten multi-scale features for matching
                 fake_features = []
                 for scale_features in disc_fake_fm_features:
@@ -763,6 +775,8 @@ class GANRefinementTrainer:
                 # FIX 3: DISABLE AMP FOR FM discriminator calls
                 with torch.cuda.amp.autocast(enabled=False):
                     disc_real_fm_logits, disc_real_fm_features = self.discriminator(real_conditional_g.detach())
+                # FIX 4: CLAMP for consistency
+                disc_real_fm_logits = [torch.clamp(logit, -10, 10) for logit in disc_real_fm_logits]
                 real_features = []
                 for scale_features in disc_real_fm_features:
                     real_features.extend(scale_features)
@@ -869,7 +883,8 @@ class GANRefinementTrainer:
             loss_g.backward()
         
         # ✅ Gradient clipping for stability (prevents explosion)
-        torch.nn.utils.clip_grad_norm_(self.generator.parameters(), max_norm=1.0)
+        # FIX 6: ADD GRADIENT CLIP (STRONGER) - 1.0 → 0.5 for tighter stability  
+        torch.nn.utils.clip_grad_norm_(self.generator.parameters(), max_norm=0.5)
         
         # ✅ Step and clear optimizer
         if self.scaler is not None:
@@ -1085,7 +1100,7 @@ def main():
     parser.add_argument(
         "--batch-size",
         type=int,
-        default=16,
+        default=8,  # FIX 5: LOWER BATCH SIZE - 16 → 8 for stability
         help="Batch size",
     )
     parser.add_argument(
@@ -1097,13 +1112,13 @@ def main():
     parser.add_argument(
         "--learning-rate-g",
         type=float,
-        default=0.0002,
+        default=5e-5,  # FIX 2: BALANCE TTUR - 0.0002 → 5e-5
         help="Learning rate for generator",
     )
     parser.add_argument(
         "--learning-rate-d",
         type=float,
-        default=0.0002,
+        default=2e-5,  # FIX 1: REDUCE D LR - 0.0002 → 2e-5 (safer TTUR)
         help="Learning rate for discriminator",
     )
     parser.add_argument(
@@ -1175,8 +1190,8 @@ def main():
     # Create trainer with production-grade settings (TTUR)
     trainer = GANRefinementTrainer(
         device=device,
-        learning_rate_g=args.learning_rate_g if args.learning_rate_g != 0.0002 else 1e-4,  # TTUR: 1e-4
-        learning_rate_d=args.learning_rate_d if args.learning_rate_d != 0.0002 else 2e-4,  # TTUR: 2e-4
+        learning_rate_g=args.learning_rate_g,  # FIX 2: BALANCE TTUR - uses updated default 5e-5
+        learning_rate_d=args.learning_rate_d,  # FIX 1: REDUCE D LR - uses updated default 2e-5
         lambda_l1=args.lambda_l1 if args.lambda_l1 != 100.0 else 50.0,  # Updated: 50.0
         lambda_perceptual=args.lambda_perceptual,
         lambda_feature_matching=10.0,
