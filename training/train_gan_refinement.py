@@ -943,10 +943,11 @@ class GANRefinementTrainer:
             "loss_adversarial": [],
             "loss_histogram": [],      # Monitoring loss
             "loss_fft": [],            # Monitoring loss
-            "loss_feature_matching": [],  # Monitoring loss
+            "loss_fm": [],             # FIX 1: Match train_step key 'loss_fm' (was 'loss_feature_matching')
             "loss_r1": [],
             "loss_adv_g": [],
         }
+        # FIX 3: CONSISTENCY - Keys here MUST match those returned by train_step() method (lines 910-920)
 
         sample_images = None
 
@@ -965,6 +966,9 @@ class GANRefinementTrainer:
                         sample_images = self.generator_ema(colorized[:4] if colorized.size(0) >= 4 else colorized)
 
                 for key, value in losses.items():
+                    # FIX 2: SAFE APPEND - Check if key exists before appending (defensive)
+                    if key not in epoch_losses:
+                        epoch_losses[key] = []
                     epoch_losses[key].append(value)
 
                 pbar.set_postfix({
