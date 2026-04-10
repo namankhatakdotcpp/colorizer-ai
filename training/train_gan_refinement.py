@@ -358,13 +358,13 @@ class GANRefinementTrainer:
         self,
         device: torch.device = None,
         learning_rate_g: float = 2e-5,  # TUNED: 5e-5 → 2e-5 (lower for stability)
-        learning_rate_d: float = 5e-5,  # TUNED: 2e-5 → 5e-5 (stronger D, TTUR 1:2.5)
+        learning_rate_d: float = 1e-5,  # FIX 2: CRITICAL - 5e-5 → 1e-5 (prevent D overpowering G)
         lambda_l1: float = 5.0,         # TUNED: 50.0 → 5.0 (reduce reconstruction aggression)
         lambda_perceptual: float = 0.5, # TUNED: 10.0 → 0.5 (gentler perceptual loss)
         lambda_adversarial: float = 1.0,
         lambda_feature_matching: float = 10.0,
         lambda_histogram: float = 5.0,
-        n_critic: int = 2,
+        n_critic: int = 1,             # FIX 3: CRITICAL - 2 → 1 (less aggressive D updates)
     ):
         """
         Initialize trainer with production-grade settings.
@@ -429,8 +429,9 @@ class GANRefinementTrainer:
         self.l1_loss = nn.L1Loss()
         
         # Label smoothing for stability (standard GAN tech)
-        self.real_label_smooth = 0.9  # Real labels: 0.9 instead of 1.0
-        self.fake_label = 0.1         # Fake labels: 0.1 instead of 0.0
+        # FIX 4: STRONGER smoothing prevents D from being overconfident
+        self.real_label_smooth = 0.85  # FIX 4: 0.9 → 0.85 (more uncertainty)
+        self.fake_label = 0.15        # FIX 4: 0.1 → 0.15 (more uncertainty)
         
         # Mixed Precision Training (AMP)
         self.scaler = torch.amp.GradScaler('cuda') if torch.cuda.is_available() else None
@@ -706,8 +707,8 @@ class GANRefinementTrainer:
                 total_d_loss.backward()
             
             # Gradient clipping for stability
-            # FIX 6: ADD GRADIENT CLIP (STRONGER) - 1.0 → 0.5 for tighter stability
-            torch.nn.utils.clip_grad_norm_(self.discriminator.parameters(), max_norm=0.5)
+            # FIX 1: GRADIENT CLIP (MOST IMPORTANT) - prevents exploding gradients
+            torch.nn.utils.clip_grad_norm_(self.discriminator.parameters(), max_norm=1.0)
             
             # 🔥 CRITICAL: After optimizer step, explicitly zero gradients
             # This prevents old gradients from interfering with G step
@@ -716,6 +717,12 @@ class GANRefinementTrainer:
                 self.scaler.update()
             else:
                 self.optimizer_d.step()
+            
+            # FIX 5: OPTIONAL WGAN-STYLE WEIGHT CLIPPING (pro mode)
+            # Helps stabilize discriminator by clipping weights to small range
+            # This is experimental and often helps with convergence
+            for p in self.discriminator.parameters():
+                p.data.clamp_(-0.01, 0.01)
             
             # 🔥 EXPLICIT GRADIENT ZEROING
             # Ensures D parameters are completely clean before G step
@@ -974,8 +981,8 @@ class GANRefinementTrainer:
             loss_g.backward()
         
         # ✅ Gradient clipping for stability (prevents explosion)
-        # FIX 6: ADD GRADIENT CLIP (STRONGER) - 1.0 → 0.5 for tighter stability  
-        torch.nn.utils.clip_grad_norm_(self.generator.parameters(), max_norm=0.5)
+        # FIX 1: GRADIENT CLIP (MOST IMPORTANT) - prevents exploding gradients
+        torch.nn.utils.clip_grad_norm_(self.generator.parameters(), max_norm=1.0)
         
         # ✅ Step and clear optimizer
         if self.scaler is not None:
@@ -1247,7 +1254,7 @@ def main():
     parser.add_argument(
         "--learning-rate-d",
         type=float,
-        default=5e-5,  # TUNED: 2e-5 → 5e-5 (stronger D, TTUR 1:2.5)
+        default=1e-5,  # FIX 2: CRITICAL - 5e-5 → 1e-5 (prevent D overpowering G)
         help="Learning rate for discriminator",
     )
     parser.add_argument(
