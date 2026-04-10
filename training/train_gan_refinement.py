@@ -357,10 +357,10 @@ class GANRefinementTrainer:
     def __init__(
         self,
         device: torch.device = None,
-        learning_rate_g: float = 5e-5,  # FIX 2: TTUR balanced - reduced further for stability
-        learning_rate_d: float = 2e-5,  # FIX 2: TTUR balanced (safer: 2e-5 instead of same as G)
-        lambda_l1: float = 50.0,
-        lambda_perceptual: float = 10.0,
+        learning_rate_g: float = 2e-5,  # TUNED: 5e-5 → 2e-5 (lower for stability)
+        learning_rate_d: float = 5e-5,  # TUNED: 2e-5 → 5e-5 (stronger D, TTUR 1:2.5)
+        lambda_l1: float = 5.0,         # TUNED: 50.0 → 5.0 (reduce reconstruction aggression)
+        lambda_perceptual: float = 0.5, # TUNED: 10.0 → 0.5 (gentler perceptual loss)
         lambda_adversarial: float = 1.0,
         lambda_feature_matching: float = 10.0,
         lambda_histogram: float = 5.0,
@@ -1241,25 +1241,25 @@ def main():
     parser.add_argument(
         "--learning-rate-g",
         type=float,
-        default=5e-5,  # FIX 2: BALANCE TTUR - 0.0002 → 5e-5
+        default=2e-5,  # TUNED: 5e-5 → 2e-5 (lower for stability)
         help="Learning rate for generator",
     )
     parser.add_argument(
         "--learning-rate-d",
         type=float,
-        default=2e-5,  # FIX 1: REDUCE D LR - 0.0002 → 2e-5 (safer TTUR)
+        default=5e-5,  # TUNED: 2e-5 → 5e-5 (stronger D, TTUR 1:2.5)
         help="Learning rate for discriminator",
     )
     parser.add_argument(
         "--lambda-l1",
         type=float,
-        default=100.0,
+        default=5.0,  # TUNED: 100.0 → 5.0 (reduce reconstruction aggression)
         help="Weight for L1 loss",
     )
     parser.add_argument(
         "--lambda-perceptual",
         type=float,
-        default=10.0,
+        default=0.5,  # TUNED: 10.0 → 0.5 (gentler perceptual loss)
         help="Weight for perceptual loss",
     )
     parser.add_argument(
@@ -1319,10 +1319,10 @@ def main():
     # Create trainer with production-grade settings (TTUR)
     trainer = GANRefinementTrainer(
         device=device,
-        learning_rate_g=args.learning_rate_g,  # FIX 2: BALANCE TTUR - uses updated default 5e-5
-        learning_rate_d=args.learning_rate_d,  # FIX 1: REDUCE D LR - uses updated default 2e-5
-        lambda_l1=args.lambda_l1 if args.lambda_l1 != 100.0 else 50.0,  # Updated: 50.0
-        lambda_perceptual=args.lambda_perceptual,
+        learning_rate_g=args.learning_rate_g,  # TUNED: 2e-5 (lower for stability)
+        learning_rate_d=args.learning_rate_d,  # TUNED: 5e-5 (stronger D, TTUR 1:2.5)
+        lambda_l1=args.lambda_l1,              # TUNED: 5.0 (reduce aggression)
+        lambda_perceptual=args.lambda_perceptual,  # TUNED: 0.5 (gentler)
         lambda_feature_matching=10.0,
         lambda_histogram=5.0,
         n_critic=2,
