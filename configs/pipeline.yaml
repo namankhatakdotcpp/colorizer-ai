@@ -6,10 +6,20 @@ pipeline:
     - bokeh
     - tone
     - contrast
+  # ✅ Checkpoint map — swap to EMA checkpoint after training completes.
+  # EMA weights produce noticeably more stable and vivid colorization.
+  checkpoints:
+    # BEFORE first good training run (current):
+    colorizer: stage1_colorizer_latest.pth
+    # AFTER training with EMA: uncomment and swap the line above for:
+    # colorizer: stage1_colorizer_ema_best.pth
+    sr: stage2_sr_latest.pth
+    depth: stage3_depth_latest.pth
+    contrast: stage4_contrast_latest.pth
   stage_options:
     colorizer:
-      color_boost: 1.35
-      ab_clip: 128.0
+      color_boost: 1.25   # Slightly reduced from 1.35 to avoid oversaturation
+      ab_clip: 110.0      # Tighter clip for more natural colors
     depth:
       inference_size: 384
     bokeh:
