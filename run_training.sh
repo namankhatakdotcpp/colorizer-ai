@@ -5,7 +5,9 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$ROOT_DIR"
 
 CHECKPOINT_DIR="${CHECKPOINT_DIR:-checkpoints}"
-COLORIZER_DATA_DIR="${COLORIZER_DATA_DIR:-datasets/flickr2k}"
+# ✅ FIX: All three dataset roots are passed so training uses ~39K images total,
+# not just the 4-5K from flickr2k alone.
+COLORIZER_DATA_ROOTS="${COLORIZER_DATA_ROOTS:-datasets/flickr2k datasets/coco datasets/div2k}"
 RGB_INPUT_DIR="${RGB_INPUT_DIR:-datasets/flickr2k/rgb}"
 SR_DATA_DIR="${SR_DATA_DIR:-datasets/div2k}"
 DEPTH_DATA_DIR="${DEPTH_DATA_DIR:-datasets/coco}"
@@ -37,10 +39,12 @@ else
 fi
 
 echo "[2/6] Stage 1 - Colorizer training"
+# ✅ FIX: --data-roots accepts multiple roots (space-separated).
+# shellcheck disable=SC2086
 torchrun --standalone --nnodes=1 --nproc_per_node="$NPROC_PER_NODE" \
   training/train_colorizer.py \
   --epochs "$STAGE1_EPOCHS" \
-  --data-root "$COLORIZER_DATA_DIR" \
+  --data-roots $COLORIZER_DATA_ROOTS \
   --checkpoint-dir "$CHECKPOINT_DIR"
 
 echo "[3/6] Verify stage1 checkpoint size"

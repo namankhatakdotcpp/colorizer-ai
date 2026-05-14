@@ -801,8 +801,34 @@ def main(args: argparse.Namespace | None = None) -> None:
                     bucket_cap_mb=ddp_bucket_cap_mb,
                     find_unused_parameters=False,
                 )
-            disc_optimizer = optim.AdamW(disc.parameters(), lr=args.lr * 0.5, weight_decay=args.weight_decay)
+            # ✅ Disc LR is 4x LOWER than generator to prevent domination.
+            disc_optimizer = optim.AdamW(disc.parameters(), lr=args.lr * 0.25, weight_decay=args.weight_decay)
             gan_criterion = nn.BCEWithLogitsLoss().to(device)
+
+        # ✅ EMA: Exponential Moving Average for stable inference weights.
+        # EMA model tracks a smoothed copy of the generator weights.
+        # At the end of training, the EMA checkpoint is what you deploy.
+        ema_model = UNetColorizer(in_channels=1, out_channels=2).to(device)
+        raw_model = model.module if hasattr(model, "module") else model
+        ema_model.load_state_dict(raw_model.state_dict())
+        ema_model.eval()
+        EMA_DECAY = 0.999  # 0.999 = slow/stable EMA. Lower = faster but noisier.
+
+        def update_ema(ema_m: torch.nn.Module, current_m: torch.nn.Module, decay: float) -> None:
+            with torch.no_grad():
+                src = current_m.module if hasattr(current_m, "module") else current_m
+                for ema_p, src_p in zip(ema_m.parameters(), src.parameters()):
+                    ema_p.data.mul_(decay).add_(src_p.data, alpha=1.0 - decay)
+                for ema_b, src_b in zip(ema_m.buffers(), src.buffers()):
+                    ema_b.copy_(src_b)
+
+        # ✅ Adaptive discriminator: tracks a running EMA of disc_loss.
+        # If disc is winning too easily (loss < DISC_LOWER_BOUND), we skip
+        # the disc update to give the generator room to breathe.
+        disc_loss_ema = 0.693  # log(2) = expected random-guess BCE loss.
+        DISC_LOWER_BOUND = 0.15  # disc is dominating below this value.
+        DISC_UPPER_BOUND = 0.80  # disc is too weak above this value.
+        disc_skip_counter = 0
 
         scaler = GradScaler(enabled=True)
         accum_steps = max(1, int(args.accum_steps))
@@ -988,16 +1014,39 @@ def main(args: argparse.Namespace | None = None) -> None:
                             fake_rgb = perceptual_loss_fn._lab_to_rgb(l_channel, ab_pred.detach()).float()
                             real_rgb = perceptual_loss_fn._lab_to_rgb(l_channel, ab_target).float()
 
-                        disc_optimizer.zero_grad(set_to_none=True)
-                        real_logits = disc(real_rgb)
-                        fake_logits = disc(fake_rgb)
-                        d_loss = (
-                            gan_criterion(real_logits, torch.ones_like(real_logits))
-                            + gan_criterion(fake_logits, torch.zeros_like(fake_logits))
-                        ) * 0.5
-                        d_loss.backward()
-                        torch.nn.utils.clip_grad_norm_(disc.parameters(), args.gradient_clip)
-                        disc_optimizer.step()
+                        # ✅ ADAPTIVE DISCRIMINATOR: only train disc when it's not
+                        # already dominating. If disc_loss_ema < LOWER_BOUND, skip
+                        # the disc update so the generator can catch up.
+                        disc_is_winning = disc_loss_ema < DISC_LOWER_BOUND
+                        disc_is_losing  = disc_loss_ema > DISC_UPPER_BOUND
+
+                        if not disc_is_winning:
+                            disc_optimizer.zero_grad(set_to_none=True)
+                            real_logits = disc(real_rgb)
+                            fake_logits = disc(fake_rgb)
+                            d_loss = (
+                                gan_criterion(real_logits, torch.ones_like(real_logits))
+                                + gan_criterion(fake_logits, torch.zeros_like(fake_logits))
+                            ) * 0.5
+                            d_loss.backward()
+                            torch.nn.utils.clip_grad_norm_(disc.parameters(), args.gradient_clip)
+                            disc_optimizer.step()
+                        else:
+                            # Disc is winning too hard — compute loss for monitoring only.
+                            with torch.no_grad():
+                                real_logits = disc(real_rgb)
+                                fake_logits = disc(fake_rgb)
+                                d_loss = (
+                                    gan_criterion(real_logits, torch.ones_like(real_logits))
+                                    + gan_criterion(fake_logits, torch.zeros_like(fake_logits))
+                                ) * 0.5
+
+                        # Update the running EMA of disc_loss.
+                        disc_loss_ema = 0.98 * disc_loss_ema + 0.02 * float(d_loss.item())
+
+                        if rank == 0 and step % max(1, args.perf_log_interval) == 0:
+                            status = "SKIP(dominating)" if disc_is_winning else ("WEAK" if disc_is_losing else "OK")
+                            print(f"[GAN] disc_loss_ema={disc_loss_ema:.4f} status={status} skipped={disc_skip_counter}")
 
                     if not torch.isfinite(total_loss):
                         raise RuntimeError("Non-finite loss detected")
@@ -1029,6 +1078,9 @@ def main(args: argparse.Namespace | None = None) -> None:
                     optimizer.zero_grad(set_to_none=True)
                     accum_counter = 0
                     grad_sync_steps += 1
+
+                    # ✅ EMA update — runs every gradient sync step.
+                    update_ema(ema_model, model, EMA_DECAY)
 
                 running_loss += float(total_loss.item())
                 running_l1_loss += float(l1_loss.item())
@@ -1115,6 +1167,27 @@ def main(args: argparse.Namespace | None = None) -> None:
                 if is_best:
                     save_checkpoint(best_path, current_epoch, model, optimizer, best_loss, avg_loss)
                     validate_checkpoint_size(best_path, MIN_CHECKPOINT_MB)
+
+                # ✅ EMA checkpoint — always saved as the inference-ready model.
+                # Use this checkpoint for deployment, NOT the raw model checkpoint.
+                ema_latest_path = ckpt_dir / f"{args.run_name}_ema_latest.pth"
+                ema_best_path   = ckpt_dir / f"{args.run_name}_ema_best.pth"
+                ema_ckpt = {
+                    "epoch": current_epoch,
+                    "model_state_dict": ema_model.state_dict(),
+                    "best_metric": best_loss,
+                    "loss": float(avg_loss),
+                    "ema_decay": EMA_DECAY,
+                }
+                tmp_ema = ema_latest_path.with_suffix(".pth.tmp")
+                torch.save(ema_ckpt, tmp_ema)
+                os.replace(tmp_ema, ema_latest_path)
+                if is_best:
+                    tmp_ema_best = ema_best_path.with_suffix(".pth.tmp")
+                    torch.save(ema_ckpt, tmp_ema_best)
+                    os.replace(tmp_ema_best, ema_best_path)
+                    print(f"[EMA] New best EMA checkpoint saved → {ema_best_path}")
+                print(f"[EMA] EMA checkpoint updated → {ema_latest_path}")
             scheduler.step()
             if rank == 0:
                 current_lr = optimizer.param_groups[0]["lr"]

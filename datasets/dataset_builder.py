@@ -274,22 +274,22 @@ class ProcessingPipeline:
             'total': 0,
         }
     
-    def process_single_image(self, image_path: Path) -> Optional[Tuple[Path, Path]]:
+    def process_single_image(self, image_path: Path, global_idx: int) -> Optional[Tuple[Path, Path]]:
         """Process one image: load, validate, save as input/target pair.
-        
+
         Returns:
             (input_path, target_path) on success, None on failure
         """
         self.stats['total'] += 1
-        
+
         # Load and preprocess
         color_img = self.validator.load_and_preprocess(image_path, self.config.target_size)
         if color_img is None:
             self.stats['failed'] += 1
             return None
-        
-        # Generate unique filename
-        filename = f"{self.stats['total']:06d}.jpg"
+
+        # Use caller-supplied global index so workers don't collide on filenames
+        filename = f"{global_idx:06d}.jpg"
         target_path = self.config.data_output_dir / "target" / filename
         
         # Save target (original color image)
@@ -320,28 +320,29 @@ class ProcessingPipeline:
         self.stats['processed'] += 1
         return (input_path, target_path)
     
-    def process_batch(self, image_paths: List[Path], worker_id: int = 0) -> int:
-        """Process a batch of images."""
+    def process_batch(self, image_paths: List[Path], worker_id: int = 0, start_idx: int = 0) -> int:
+        """Process a batch of images, using start_idx for globally unique filenames."""
         success_count = 0
-        
-        for idx, image_path in enumerate(image_paths):
-            result = self.process_single_image(image_path)
+
+        for local_idx, image_path in enumerate(image_paths):
+            global_idx = start_idx + local_idx + 1
+            result = self.process_single_image(image_path, global_idx)
             if result is not None:
                 success_count += 1
-            
-            if (idx + 1) % self.config.batch_size == 0:
-                logger.info(f"Worker {worker_id}: Processed {idx + 1}/{len(image_paths)} images")
-        
+
+            if (local_idx + 1) % self.config.batch_size == 0:
+                logger.info(f"Worker {worker_id}: Processed {local_idx + 1}/{len(image_paths)} images")
+
         return success_count
 
 
 def worker_process_batch(args: Tuple) -> dict:
     """Multiprocessing worker function."""
-    image_paths, config, mode, worker_id = args
-    
+    image_paths, config, mode, worker_id, start_idx = args
+
     pipeline = ProcessingPipeline(config, mode=mode)
-    pipeline.process_batch(image_paths, worker_id=worker_id)
-    
+    pipeline.process_batch(image_paths, worker_id=worker_id, start_idx=start_idx)
+
     return {
         'worker_id': worker_id,
         'processed': pipeline.stats['processed'],
@@ -459,27 +460,36 @@ def build_dataset(config: Config, mode: str = "grayscale") -> dict:
     # Option A: Single-process (for debugging)
     if config.num_workers == 1:
         pipeline = ProcessingPipeline(config, mode=mode)
-        for image_path in all_images:
-            pipeline.process_single_image(image_path)
-        
+        pipeline.process_batch(all_images, worker_id=0, start_idx=0)
+
         logger.info(f"\n✅ Processed: {pipeline.stats['processed']}")
         logger.info(f"❌ Failed: {pipeline.stats['failed']}")
-    
+
     # Option B: Multiprocessing
     else:
-        chunk_size = len(all_images) // config.num_workers
-        chunks = [all_images[i:i+chunk_size] for i in range(0, len(all_images), chunk_size)]
-        
+        # np.array_split handles uneven remainders and avoids truncation
+        n = min(config.num_workers, len(all_images))
+        k, m = divmod(len(all_images), n)
+        chunks = [all_images[i*k + min(i, m):(i+1)*k + min(i+1, m)] for i in range(n)]
+
+        # Each worker needs a global start index so filenames don't collide
+        start_indices = []
+        running = 0
+        for chunk in chunks:
+            start_indices.append(running)
+            running += len(chunk)
+
         worker_args = [
-            (chunk, config, mode, i) for i, chunk in enumerate(chunks)
+            (chunk, config, mode, i, start_idx)
+            for i, (chunk, start_idx) in enumerate(zip(chunks, start_indices))
         ]
-        
+
         with Pool(config.num_workers) as pool:
             results = pool.map(worker_process_batch, worker_args)
-        
+
         total_processed = sum(r['processed'] for r in results)
         total_failed = sum(r['failed'] for r in results)
-        
+
         logger.info(f"\n✅ Total processed: {total_processed}")
         logger.info(f"❌ Total failed: {total_failed}")
     
