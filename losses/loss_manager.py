@@ -110,7 +110,7 @@ class LossManager(nn.Module):
         self,
         device: torch.device = None,
         lambda_adversarial: float = 1.0,
-        lambda_l1: float = 50.0,
+        lambda_l1: float = 5.0,
         lambda_perceptual: float = 10.0,
         lambda_feature_matching: float = 10.0,
         lambda_histogram: float = 5.0,
@@ -121,7 +121,7 @@ class LossManager(nn.Module):
         Args:
             device: Device to use (cuda or cpu)
             lambda_adversarial: Weight for adversarial loss
-            lambda_l1: Weight for L1 reconstruction loss
+            lambda_l1: Weight for L1 reconstruction loss (REDUCED from 50.0 to 5.0 to prevent grayscale equilibrium)
             lambda_perceptual: Weight for perceptual loss
             lambda_feature_matching: Weight for feature matching loss
             lambda_histogram: Weight for histogram loss
@@ -438,7 +438,7 @@ class LossManager(nn.Module):
 def create_loss_manager(
     device: torch.device = None,
     lambda_adversarial: float = 1.0,
-    lambda_l1: float = 50.0,
+    lambda_l1: float = 5.0,
     lambda_perceptual: float = 10.0,
     lambda_feature_matching: float = 10.0,
     lambda_histogram: float = 5.0,
@@ -448,6 +448,7 @@ def create_loss_manager(
 
     Args:
         device: Device to use
+        lambda_l1: L1 loss weight (reduced from 50.0 to 5.0 to prevent grayscale convergence)
         lambda_*: Loss weights
 
     Returns:

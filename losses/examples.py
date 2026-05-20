@@ -20,7 +20,7 @@ def example_basic_usage():
     loss_manager = create_loss_manager(
         device=device,
         lambda_adversarial=1.0,
-        lambda_l1=50.0,
+        lambda_l1=5.0,
         lambda_perceptual=10.0,
         lambda_feature_matching=10.0,
         lambda_histogram=5.0,
@@ -101,14 +101,14 @@ def example_custom_weights():
     
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
-    # Create with different weights (emphasize L1 for sharp outputs)
+    # Create with different weights (for colorization tasks)
     loss_manager = LossManager(
         device=device,
         lambda_adversarial=0.5,      # Reduce adversarial for stability
-        lambda_l1=100.0,              # Increase L1 for detail preservation
-        lambda_perceptual=5.0,        # Reduce perceptual
+        lambda_l1=10.0,              # REDUCED: High L1 causes grayscale convergence in colorization
+        lambda_perceptual=5.0,       # Reduce perceptual
         lambda_feature_matching=20.0,  # Increase FM for better structure
-        lambda_histogram=10.0,         # Increase histogram for color accuracy
+        lambda_histogram=10.0,       # Increase histogram for color accuracy
     )
     
     print("\nConfigured with weights:")
